@@ -492,18 +492,31 @@ export default function LudoGame() {
                 <span className="absolute w-[70%] h-[70%] flex items-center justify-center opacity-15">
                   <CharacterSprite cls={p.characterClass} emojiSize="clamp(56px, 16vw, 88px)" />
                 </span>
-                <div className="grid grid-cols-2 gap-2 pointer-events-auto">
+                <div className="grid grid-cols-2 gap-x-2 gap-y-4 pointer-events-auto">
                   {p.pieces.filter(pc => pc.position === -1).map(pc => {
                     const selectable = canMoveNow(pc);
+                    if (hasSprites(p.characterClass)) {
+                      // Sprite standing on a team-colored base, same as on the board
+                      return (
+                        <div
+                          key={pc.id}
+                          onClick={() => { if (selectable) void movePiece(pc.id); }}
+                          className={`anim-pop-in relative w-8 h-8 sm:w-10 sm:h-10 transition-transform ${selectable ? 'cursor-pointer scale-110' : ''}`}
+                        >
+                          <div className={`absolute left-1/2 bottom-0 -translate-x-1/2 w-full h-1/2 rounded-[50%] border-2 border-white/80 ${COLOR_BG[p.color]} ${selectable ? 'anim-selectable' : ''}`} />
+                          <div className="absolute left-1/2 -bottom-[10%] -translate-x-1/2 w-[160%] h-[160%]">
+                            <CharacterSprite cls={p.characterClass} facing={facing[pc.id]} />
+                          </div>
+                        </div>
+                      );
+                    }
                     return (
                       <div
                         key={pc.id}
                         onClick={() => { if (selectable) void movePiece(pc.id); }}
                         className={`anim-pop-in w-8 h-8 sm:w-10 sm:h-10 rounded-full border-2 sm:border-4 border-white shadow-xl flex items-center justify-center text-base sm:text-xl ${COLOR_BG[p.color]} ${selectable ? 'anim-selectable cursor-pointer scale-110' : ''} transition-transform`}
                       >
-                        <span className={`w-full h-full flex items-center justify-center ${hasSprites(p.characterClass) ? 'scale-125' : ''}`}>
-                          <CharacterSprite cls={p.characterClass} facing={facing[pc.id]} />
-                        </span>
+                        <CharacterSprite cls={p.characterClass} facing={facing[pc.id]} />
                       </div>
                     );
                   })}
@@ -539,7 +552,7 @@ export default function LudoGame() {
                     // Pixel sprite standing on a team-colored base
                     <div className={`relative w-full h-full ${pieceAnims[piece.id] === 'anim-hit' ? 'anim-hit' : ''}`}>
                       <div className={`absolute left-1/2 bottom-[5%] -translate-x-1/2 w-[110%] h-[45%] rounded-[50%] border-2 border-white/80 ${COLOR_BG[piece.color]} ${selectable ? 'anim-selectable' : ''}`} />
-                      <div className="absolute left-1/2 bottom-[20%] -translate-x-1/2 w-[170%] h-[170%]">
+                      <div className="absolute left-1/2 bottom-[3%] -translate-x-1/2 w-[170%] h-[170%]">
                         <CharacterSprite cls={player.characterClass} anim={spriteAnimOf(piece.id)} facing={facing[piece.id]} />
                       </div>
                       <div className="absolute -top-[95%] left-1/2 -translate-x-1/2 w-[120%] h-1 bg-black/60 rounded-full overflow-hidden">
