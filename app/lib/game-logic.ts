@@ -154,10 +154,15 @@ export const resolveMove = (players: Player[], playerIndex: number, pieceId: str
         if (target.position < 0 || target.position >= BOARD_SIZE) return;
         const targetGlobal = getGlobalIndex(target.position, target.color);
         if (SAFE_ZONES.includes(targetGlobal)) return;
-        if (circularDistance(currentGlobal, targetGlobal) > mover.range) return;
+        const dist = circularDistance(currentGlobal, targetGlobal);
+        if (dist > mover.range) return;
+        // Archers can't shoot point-blank
+        if (player.characterClass === 'archer' && dist === 0) return;
 
         const armor = other.characterClass === 'knight' ? 1 : 0;
-        const damage = Math.max(1, mover.attack - armor);
+        // Mage fireballs lose 1 damage at distance 2 and beyond
+        const falloff = player.characterClass === 'mage' && dist >= 2 ? 1 : 0;
+        const damage = Math.max(1, mover.attack - falloff - armor);
         target.hp -= damage;
         const killed = target.hp <= 0;
         events.push({ type: 'attack', attackerId: mover.id, targetId: target.id, damage, hpAfter: Math.max(0, target.hp), killed });
