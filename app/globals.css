@@ -159,3 +159,12 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .anim-idle, .anim-selectable, .anim-card-float, .anim-confetti { animation: none; }
 }
+
+/* ---------- Pixel sprites ---------- */
+
+.pixelated { image-rendering: pixelated; }
+
+@keyframes sprite-play {
+  from { background-position: 0% 0; }
+  to { background-position: 100% 0; }
+}

@@ -7,6 +7,8 @@ import {
   canMove, resolveMove, chooseBotMove, findPiece, getNextPlayerIndex, isPlayerFinished, getPieceCoords, cellCenter,
 } from '../lib/game-logic';
 import { CHARACTERS, CHARACTER_LIST } from '../lib/characters';
+import { Facing, SpriteAnim, hasSprites } from '../lib/sprites';
+import CharacterSprite from './CharacterSprite';
 import Die from './Die';
 import SetupScreen from './SetupScreen';
 import VictoryOverlay from './VictoryOverlay';
@@ -27,7 +29,17 @@ const COLOR_STRETCH: Record<Color, string> = { red: 'bg-red-200', blue: 'bg-blue
 const COLOR_BASE: Record<Color, string> = { red: 'bg-red-500/20', blue: 'bg-blue-500/20', yellow: 'bg-yellow-500/20', green: 'bg-green-500/20' };
 const BASE_POSITION: Record<Color, string> = { red: 'top-0 left-0', blue: 'top-0 right-0', green: 'bottom-0 left-0', yellow: 'bottom-0 right-0' };
 
-const SPEEDS = [1, 2, 4];
+type AnimMode = 'cinematic' | 'fast' | 'skip';
+type Camera = { x: number; y: number; zoom: number };
+
+// speed paces the game logic, fx paces the visual effects (skip still flashes damage numbers)
+const MODES: Record<AnimMode, { label: string; speed: number; fx: number; camera: boolean }> = {
+  cinematic: { label: '🎬 Cinematic', speed: 1, fx: 1, camera: true },
+  fast: { label: '⚡ Fast', speed: 2.5, fx: 2, camera: false },
+  skip: { label: '⏭ Skip', speed: 25, fx: 1.5, camera: false },
+};
+const BIRDVIEW: Camera = { x: 50, y: 50, zoom: 1 };
+const ZOOM = 2.2;
 const STEP_MS = 220;
 const PROJECTILE_MS = 380;
 const LOG_SIZE = 12;
@@ -65,14 +77,35 @@ export default function LudoGame() {
   const [effects, setEffects] = useState<Effect[]>([]);
   const [boardShaking, setBoardShaking] = useState(false);
   const [banner, setBanner] = useState<{ key: number; text: string; emoji: string; color: Color } | null>(null);
-  const [speedIdx, setSpeedIdx] = useState(0);
+  const [mode, setMode] = useState<AnimMode>('cinematic');
+  const [camera, setCamera] = useState<Camera>(BIRDVIEW);
+  const [facing, setFacing] = useState<Record<string, Facing>>({});
+  const [walkingId, setWalkingId] = useState<string | null>(null);
 
   const speedRef = useRef(1);
+  const fxSpeedRef = useRef(1);
+  const cameraOnRef = useRef(true);
+  const skipRef = useRef(false); // tap during an animation to fast-forward it
   const busyRef = useRef(false);
   const effectId = useRef(0);
   const focusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const wait = useCallback((ms: number) => sleep(ms / speedRef.current), []);
+  const wait = useCallback((ms: number) => (skipRef.current ? Promise.resolve() : sleep(ms / speedRef.current)), []);
+
+  const changeMode = (next: AnimMode) => {
+    setMode(next);
+    speedRef.current = MODES[next].speed;
+    fxSpeedRef.current = MODES[next].fx;
+    cameraOnRef.current = MODES[next].camera;
+    if (!MODES[next].camera) setCamera(BIRDVIEW);
+  };
+
+  // Keep the zoomed viewport inside the board
+  const focusCamera = useCallback((x: number, y: number, zoom: number) => {
+    if (!cameraOnRef.current || skipRef.current) return;
+    const half = 50 / zoom;
+    setCamera({ x: Math.min(100 - half, Math.max(half, x)), y: Math.min(100 - half, Math.max(half, y)), zoom });
+  }, []);
 
   const currentPlayer = gameState.players[gameState.currentPlayerIndex];
 
@@ -116,7 +149,7 @@ export default function LudoGame() {
   const spawn = useCallback((effect: NewEffect, duration: number) => {
     const id = ++effectId.current;
     setEffects(prev => [...prev, { ...effect, id } as Effect]);
-    setTimeout(() => setEffects(prev => prev.filter(e => e.id !== id)), duration / speedRef.current);
+    setTimeout(() => setEffects(prev => prev.filter(e => e.id !== id)), duration / fxSpeedRef.current);
   }, []);
 
   const flashPiece = useCallback((pieceId: string, className: string, duration: number) => {
@@ -126,7 +159,7 @@ export default function LudoGame() {
       const next = { ...prev };
       delete next[pieceId];
       return next;
-    }), duration / speedRef.current);
+    }), duration / fxSpeedRef.current);
   }, []);
 
   const patchPiece = useCallback((pieceId: string, patch: Partial<Piece>) => {
@@ -135,7 +168,7 @@ export default function LudoGame() {
 
   const shakeBoard = useCallback(() => {
     setBoardShaking(true);
-    setTimeout(() => setBoardShaking(false), 400 / speedRef.current);
+    setTimeout(() => setBoardShaking(false), 400 / fxSpeedRef.current);
   }, []);
 
   // ---- Focus (tile details) ----
@@ -222,18 +255,38 @@ export default function LudoGame() {
     if (!result) return;
 
     busyRef.current = true;
+    skipRef.current = false;
     setPhase('animating');
     setFocusedTile(null);
 
     const player = before[playerIndex];
     const def = CHARACTERS[player.characterClass];
     const moverXY = cellCenter(getPieceCoords(result.to, player.color));
+    const turnTo = (id: string, fromX: number, toX: number) => {
+      if (toX !== fromX) setFacing(prev => ({ ...prev, [id]: toX > fromX ? 'right' : 'left' }));
+    };
 
-    // 1. Walk tile by tile
+    // Cinematic close-ups for human moves and every fight; quiet bot moves stay in birdview
+    const hasCombat = result.events.some(ev => ev.type === 'attack');
+    const closeUp = !player.isBot || hasCombat;
+
+    // 1. Walk tile by tile, camera following
+    if (closeUp) {
+      const startXY = cellCenter(result.from === -1 ? getPieceCoords(0, player.color) : getPieceCoords(result.from, player.color));
+      focusCamera(startXY.x, startXY.y, ZOOM);
+      await wait(450);
+    }
+    setWalkingId(pieceId);
+    let prevX = result.from === -1 ? null : cellCenter(getPieceCoords(result.from, player.color)).x;
     for (const pos of result.path) {
+      const stepXY = cellCenter(getPieceCoords(pos, player.color));
+      if (prevX !== null) turnTo(pieceId, prevX, stepXY.x);
+      prevX = stepXY.x;
       patchPiece(pieceId, { position: pos });
+      if (closeUp) focusCamera(stepXY.x, stepXY.y, ZOOM);
       await wait(STEP_MS);
     }
+    setWalkingId(null);
     if (result.from === -1) {
       spawn({ kind: 'ring', ...moverXY, className: 'border-white' }, 600);
       await wait(200);
@@ -251,6 +304,13 @@ export default function LudoGame() {
         const target = findPiece(before, ev.targetId)!;
         const targetXY = cellCenter(getPieceCoords(target.piece.position, target.piece.color));
         const melee = targetXY.x === moverXY.x && targetXY.y === moverXY.y;
+
+        // Frame attacker and target together
+        const span = Math.max(Math.abs(targetXY.x - moverXY.x), Math.abs(targetXY.y - moverXY.y));
+        focusCamera((moverXY.x + targetXY.x) / 2, (moverXY.y + targetXY.y) / 2, Math.max(1.3, Math.min(ZOOM, 60 / (span + 12))));
+        turnTo(ev.attackerId, moverXY.x, targetXY.x);
+        turnTo(ev.targetId, targetXY.x, moverXY.x);
+        await wait(cameraOnRef.current ? 350 : 0);
 
         flashPiece(ev.attackerId, 'anim-attack', 350);
         if (melee) {
@@ -284,6 +344,11 @@ export default function LudoGame() {
       }
     }
 
+    if (closeUp && cameraOnRef.current) {
+      setCamera(BIRDVIEW);
+      await wait(350);
+    }
+
     // 3. Commit the resolved state
     const finished = isPlayerFinished(result.players[playerIndex]);
     const winners = finished && !gameState.winners.includes(player.name) ? [...gameState.winners, player.name] : gameState.winners;
@@ -303,9 +368,11 @@ export default function LudoGame() {
       isGameOver,
     }));
     setOverrides({});
+    setCamera(BIRDVIEW);
     setPhase('idle');
+    skipRef.current = false;
     busyRef.current = false;
-  }, [phase, gameState, wait, spawn, flashPiece, patchPiece, shakeBoard]);
+  }, [phase, gameState, wait, spawn, flashPiece, patchPiece, shakeBoard, focusCamera]);
 
   // Turn banner whenever the active player changes
   useEffect(() => {
@@ -336,7 +403,14 @@ export default function LudoGame() {
     return <SetupScreen configs={playerConfigs} onChange={setPlayerConfigs} onStart={startGame} />;
   }
 
-  const speed = SPEEDS[speedIdx];
+  const speed = MODES[mode].speed;
+  const spriteAnimOf = (id: string): SpriteAnim => {
+    const a = pieceAnims[id];
+    if (a === 'anim-die') return 'death';
+    if (a === 'anim-hit') return 'hurt';
+    if (a === 'anim-attack') return 'attack';
+    return walkingId === id ? 'walk' : 'idle';
+  };
   const isHumanTurn = currentPlayer && !currentPlayer.isBot;
   const viewCurrent = viewPlayers[gameState.currentPlayerIndex];
   const canMoveNow = (piece: Piece) =>
@@ -349,148 +423,181 @@ export default function LudoGame() {
   const stackSeen: Record<string, number> = {};
 
   return (
-    <div className="flex flex-col items-center p-2 sm:p-4 bg-slate-900 min-h-screen text-white font-sans overflow-x-hidden" style={{ '--speed': speed } as React.CSSProperties}>
+    <div className="flex flex-col items-center p-2 sm:p-4 bg-slate-900 min-h-screen text-white font-sans overflow-x-hidden" style={{ '--speed': MODES[mode].fx } as React.CSSProperties}>
       <h1 className="text-2xl sm:text-4xl font-bold mb-4 text-yellow-400 uppercase tracking-tighter">Ludo RPG</h1>
       <div className="flex flex-col lg:flex-row gap-4 items-center lg:items-start w-full max-w-6xl justify-center">
         {/* BOARD */}
-        <div className={`relative w-full max-w-[480px] aspect-square bg-white border-4 sm:border-8 border-slate-700 shadow-2xl rounded-lg overflow-hidden touch-none ${boardShaking ? 'anim-board-shake' : ''}`}>
-          <div className="grid grid-cols-15 grid-rows-15 w-full h-full text-slate-800" style={{ fontSize: 'min(2vw, 12px)' }}>
-            {CELLS.map((cell, i) => {
-              const key = `${Math.floor(i / 15)},${i % 15}`;
-              const isDestination = destinations.has(key);
-              const destRing = isDestination ? 'ring-2 ring-inset ring-yellow-400 animate-pulse' : '';
+        <div className={`relative w-full max-w-[480px] aspect-square bg-white border-4 sm:border-8 border-slate-700 shadow-2xl rounded-lg overflow-hidden touch-none ${boardShaking ? 'anim-board-shake' : ''}`}
+          onClick={() => { if (phase === 'animating') { skipRef.current = true; setCamera(BIRDVIEW); } }}
+        >
+          {/* Camera: everything inside the world zooms and pans together */}
+          <div
+            className="absolute inset-0 origin-top-left"
+            style={{
+              transform: `translate(${50 - camera.x * camera.zoom}%, ${50 - camera.y * camera.zoom}%) scale(${camera.zoom})`,
+              transition: `transform ${camera.zoom > 1 ? 300 : 500}ms ease-in-out`,
+            }}
+          >
+            <div className="grid grid-cols-15 grid-rows-15 w-full h-full text-slate-800" style={{ fontSize: 'min(2vw, 12px)' }}>
+              {CELLS.map((cell, i) => {
+                const key = `${Math.floor(i / 15)},${i % 15}`;
+                const isDestination = destinations.has(key);
+                const destRing = isDestination ? 'ring-2 ring-inset ring-yellow-400 animate-pulse' : '';
 
-              if (cell.kind === 'path') {
-                const idx = cell.idx;
-                const highlight = rangeHighlights[idx];
-                const startColor = COLORS.find(c => START_POSITIONS[c] === idx);
-                let bgColor = startColor ? COLOR_TILE[startColor] : 'bg-slate-50';
-                let content: React.ReactNode = null;
-                if (highlight) {
-                  bgColor = `${COLOR_TILE[highlight]} animate-pulse`;
-                  content = <div className={`w-1.5 h-1.5 rounded-full opacity-40 ${COLOR_BG[highlight]}`} />;
-                }
-                const buff = BUFF_LOCATIONS[idx];
-                if (buff === 'BUFF_HEAL') content = <span className="text-pink-500">♥</span>;
-                else if (buff === 'BUFF_ATTACK') content = <span className="text-orange-500">⚔</span>;
-                else if (buff === 'BUFF_RANGE') content = <span className="text-blue-500">🎯</span>;
-                if (SAFE_ZONES.includes(idx)) {
-                  if (!startColor) bgColor = 'bg-slate-200';
-                  content = <span className="text-slate-400 opacity-40">★</span>;
-                }
-                const hasPiece = () => viewPlayers.some(pl => pl.pieces.some(p => p.position >= 0 && p.position < 52 && getGlobalIndex(p.position, p.color) === idx));
-                return (
-                  <div key={i} {...focusHandlers({ globalIdx: idx }, hasPiece)} className={`${bgColor} ${destRing} border border-slate-200 flex items-center justify-center cursor-pointer select-none`}>
-                    {content}
-                  </div>
-                );
-              }
-
-              if (cell.kind === 'stretch') {
-                const { color, localPos } = cell;
-                const hasPiece = () => viewPlayers.some(pl => pl.pieces.some(p => p.color === color && p.position === localPos));
-                return (
-                  <div key={i} {...focusHandlers({ globalIdx: 0, color, localPos }, hasPiece)} className={`${COLOR_STRETCH[color]} ${destRing} flex items-center justify-center cursor-pointer border border-white/40 select-none`}>
-                    {localPos === FINISH && <span className="opacity-60">👑</span>}
-                  </div>
-                );
-              }
-
-              if (cell.kind === 'base') return <div key={i} className={COLOR_BASE[cell.color]} />;
-              if (cell.kind === 'center') return <div key={i} className="bg-slate-300" />;
-              return <div key={i} />;
-            })}
-          </div>
-
-          {/* Home bases */}
-          {viewPlayers.map(p => (
-            <div key={p.color} className={`absolute w-[40%] h-[40%] flex items-center justify-center pointer-events-none ${BASE_POSITION[p.color]}`}>
-              <span className="absolute text-[64px] sm:text-[88px] opacity-15 select-none">{CHARACTERS[p.characterClass].emoji}</span>
-              <div className="grid grid-cols-2 gap-2 pointer-events-auto">
-                {p.pieces.filter(pc => pc.position === -1).map(pc => {
-                  const selectable = canMoveNow(pc);
+                if (cell.kind === 'path') {
+                  const idx = cell.idx;
+                  const highlight = rangeHighlights[idx];
+                  const startColor = COLORS.find(c => START_POSITIONS[c] === idx);
+                  let bgColor = startColor ? COLOR_TILE[startColor] : 'bg-slate-50';
+                  let content: React.ReactNode = null;
+                  if (highlight) {
+                    bgColor = `${COLOR_TILE[highlight]} animate-pulse`;
+                    content = <div className={`w-1.5 h-1.5 rounded-full opacity-40 ${COLOR_BG[highlight]}`} />;
+                  }
+                  const buff = BUFF_LOCATIONS[idx];
+                  if (buff === 'BUFF_HEAL') content = <span className="text-pink-500">♥</span>;
+                  else if (buff === 'BUFF_ATTACK') content = <span className="text-orange-500">⚔</span>;
+                  else if (buff === 'BUFF_RANGE') content = <span className="text-blue-500">🎯</span>;
+                  if (SAFE_ZONES.includes(idx)) {
+                    if (!startColor) bgColor = 'bg-slate-200';
+                    content = <span className="text-slate-400 opacity-40">★</span>;
+                  }
+                  const hasPiece = () => viewPlayers.some(pl => pl.pieces.some(p => p.position >= 0 && p.position < 52 && getGlobalIndex(p.position, p.color) === idx));
                   return (
-                    <div
-                      key={pc.id}
-                      onClick={() => { if (selectable) void movePiece(pc.id); }}
-                      className={`anim-pop-in w-8 h-8 sm:w-10 sm:h-10 rounded-full border-2 sm:border-4 border-white shadow-xl flex items-center justify-center text-base sm:text-xl ${COLOR_BG[p.color]} ${selectable ? 'anim-selectable cursor-pointer scale-110' : ''} transition-transform`}
-                    >
-                      <span className={selectable ? 'anim-idle' : ''}>{CHARACTERS[p.characterClass].emoji}</span>
+                    <div key={i} {...focusHandlers({ globalIdx: idx }, hasPiece)} className={`${bgColor} ${destRing} border border-slate-200 flex items-center justify-center cursor-pointer select-none`}>
+                      {content}
                     </div>
                   );
-                })}
-              </div>
-            </div>
-          ))}
+                }
 
-          {/* Pieces on the board */}
-          {boardPieces.map(({ piece, player }) => {
-            const coords = getPieceCoords(piece.position, piece.color);
-            const k = coords.join(',');
-            const stackIdx = stackSeen[k] = (stackSeen[k] ?? -1) + 1;
-            const { x, y } = cellCenter(coords);
-            const offset = (stackIdx - (stackCount[k] - 1) / 2) * 2;
-            const selectable = canMoveNow(piece);
-            const hpRatio = piece.hp / Math.max(piece.maxHp, piece.hp);
-            const hpColor = hpRatio > 0.66 ? 'bg-green-400' : hpRatio > 0.34 ? 'bg-yellow-400' : 'bg-red-500';
-            const transition = `${STEP_MS / speed * 0.8}ms`;
-
-            return (
-              <div
-                key={piece.id}
-                {...focusHandlers(focusDataFor(piece), () => true)}
-                onClick={() => { if (selectable) void movePiece(piece.id); }}
-                className={`absolute cursor-pointer ${selectable ? 'z-50' : pieceAnims[piece.id] ? 'z-40' : 'z-20'}`}
-                style={{
-                  left: `${x + offset}%`, top: `${y + offset}%`, width: '6.2%', height: '6.2%',
-                  transform: 'translate(-50%, -50%)',
-                  transition: `left ${transition} ease-out, top ${transition} ease-out`,
-                }}
-              >
-                <div className={`w-full h-full ${pieceAnims[piece.id] ?? ''}`}>
-                  <div key={piece.position} className="w-full h-full anim-hop">
-                    <div className={`relative w-full h-full rounded-full border-2 border-white shadow-md flex items-center justify-center transition-transform ${COLOR_BG[piece.color]} ${selectable ? 'anim-selectable scale-125' : ''}`}>
-                      <span className="anim-idle leading-none select-none" style={{ fontSize: 'min(3.2vw, 16px)' }}>{CHARACTERS[player.characterClass].emoji}</span>
-                      <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-[120%] h-1 bg-black/60 rounded-full overflow-hidden">
-                        <div className={`h-full ${hpColor} transition-all duration-300`} style={{ width: `${hpRatio * 100}%` }} />
-                      </div>
-                      <div className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 bg-black/70 px-1 rounded-full text-[6px] sm:text-[8px] font-bold text-yellow-300 whitespace-nowrap">
-                        ⚔{piece.attack}{piece.range > 0 ? ` 🎯${piece.range}` : ''}
-                      </div>
+                if (cell.kind === 'stretch') {
+                  const { color, localPos } = cell;
+                  const hasPiece = () => viewPlayers.some(pl => pl.pieces.some(p => p.color === color && p.position === localPos));
+                  return (
+                    <div key={i} {...focusHandlers({ globalIdx: 0, color, localPos }, hasPiece)} className={`${COLOR_STRETCH[color]} ${destRing} flex items-center justify-center cursor-pointer border border-white/40 select-none`}>
+                      {localPos === FINISH && <span className="opacity-60">👑</span>}
                     </div>
-                  </div>
+                  );
+                }
+
+                if (cell.kind === 'base') return <div key={i} className={COLOR_BASE[cell.color]} />;
+                if (cell.kind === 'center') return <div key={i} className="bg-slate-300" />;
+                return <div key={i} />;
+              })}
+            </div>
+
+            {/* Home bases */}
+            {viewPlayers.map(p => (
+              <div key={p.color} className={`absolute w-[40%] h-[40%] flex items-center justify-center pointer-events-none ${BASE_POSITION[p.color]}`}>
+                <span className="absolute w-[70%] h-[70%] flex items-center justify-center opacity-15">
+                  <CharacterSprite cls={p.characterClass} emojiSize="clamp(56px, 16vw, 88px)" />
+                </span>
+                <div className="grid grid-cols-2 gap-2 pointer-events-auto">
+                  {p.pieces.filter(pc => pc.position === -1).map(pc => {
+                    const selectable = canMoveNow(pc);
+                    return (
+                      <div
+                        key={pc.id}
+                        onClick={() => { if (selectable) void movePiece(pc.id); }}
+                        className={`anim-pop-in w-8 h-8 sm:w-10 sm:h-10 rounded-full border-2 sm:border-4 border-white shadow-xl flex items-center justify-center text-base sm:text-xl ${COLOR_BG[p.color]} ${selectable ? 'anim-selectable cursor-pointer scale-110' : ''} transition-transform`}
+                      >
+                        <span className={`w-full h-full flex items-center justify-center ${hasSprites(p.characterClass) ? 'scale-125' : ''}`}>
+                          <CharacterSprite cls={p.characterClass} facing={facing[pc.id]} />
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
-            );
-          })}
+            ))}
 
-          {/* Effects layer */}
-          <div className="absolute inset-0 pointer-events-none z-[70]">
-            {effects.map(fx => {
-              if (fx.kind === 'projectile') {
-                return (
-                  <div
-                    key={fx.id}
-                    className="absolute fx-projectile text-xl text-amber-300 drop-shadow-[0_0_6px_rgba(251,191,36,0.9)]"
-                    style={{ '--x1': `${fx.x}%`, '--y1': `${fx.y}%`, '--x2': `${fx.x2}%`, '--y2': `${fx.y2}%`, '--dur': `${PROJECTILE_MS / speed}ms`, transform: 'translate(-50%, -50%)' } as React.CSSProperties}
-                  >
-                    <div className={fx.spin ? 'fx-spin' : ''} style={fx.spin ? undefined : { transform: `rotate(${fx.angle}deg)` }}>{fx.text}</div>
-                  </div>
-                );
-              }
-              if (fx.kind === 'ring') {
-                return <div key={fx.id} className={`absolute fx-ring w-[7%] h-[7%] rounded-full border-4 ${fx.className}`} style={{ left: `${fx.x}%`, top: `${fx.y}%` }} />;
-              }
-              if (fx.kind === 'burst') {
-                return <div key={fx.id} className="absolute fx-burst text-2xl" style={{ left: `${fx.x}%`, top: `${fx.y}%` }}>{fx.text}</div>;
-              }
+            {/* Pieces on the board */}
+            {boardPieces.map(({ piece, player }) => {
+              const coords = getPieceCoords(piece.position, piece.color);
+              const k = coords.join(',');
+              const stackIdx = stackSeen[k] = (stackSeen[k] ?? -1) + 1;
+              const { x, y } = cellCenter(coords);
+              const offset = (stackIdx - (stackCount[k] - 1) / 2) * 2;
+              const selectable = canMoveNow(piece);
+              const hpRatio = piece.hp / Math.max(piece.maxHp, piece.hp);
+              const hpColor = hpRatio > 0.66 ? 'bg-green-400' : hpRatio > 0.34 ? 'bg-yellow-400' : 'bg-red-500';
+              const transition = `${STEP_MS / speed * 0.8}ms`;
+
               return (
-                <div key={fx.id} className={`absolute fx-float font-black whitespace-nowrap [text-shadow:0_2px_0_#000,0_0_6px_#000] ${fx.className}`} style={{ left: `${fx.x}%`, top: `${fx.y}%` }}>
-                  {fx.text}
+                <div
+                  key={piece.id}
+                  {...focusHandlers(focusDataFor(piece), () => true)}
+                  onClick={() => { if (selectable) void movePiece(piece.id); }}
+                  className={`absolute cursor-pointer ${selectable ? 'z-50' : pieceAnims[piece.id] ? 'z-40' : 'z-20'}`}
+                  style={{
+                    left: `${x + offset}%`, top: `${y + offset}%`, width: '6.2%', height: '6.2%',
+                    transform: 'translate(-50%, -50%)',
+                    transition: `left ${transition} ease-out, top ${transition} ease-out`,
+                  }}
+                >
+                  {hasSprites(player.characterClass) ? (
+                    // Pixel sprite standing on a team-colored base
+                    <div className={`relative w-full h-full ${pieceAnims[piece.id] === 'anim-hit' ? 'anim-hit' : ''}`}>
+                      <div className={`absolute left-1/2 bottom-[5%] -translate-x-1/2 w-[110%] h-[45%] rounded-[50%] border-2 border-white/80 ${COLOR_BG[piece.color]} ${selectable ? 'anim-selectable' : ''}`} />
+                      <div className="absolute left-1/2 bottom-[20%] -translate-x-1/2 w-[170%] h-[170%]">
+                        <CharacterSprite cls={player.characterClass} anim={spriteAnimOf(piece.id)} facing={facing[piece.id]} />
+                      </div>
+                      <div className="absolute -top-[95%] left-1/2 -translate-x-1/2 w-[120%] h-1 bg-black/60 rounded-full overflow-hidden">
+                        <div className={`h-full ${hpColor} transition-all duration-300`} style={{ width: `${hpRatio * 100}%` }} />
+                      </div>
+                    </div>
+                  ) : (
+                    <div className={`w-full h-full ${pieceAnims[piece.id] ?? ''}`}>
+                      <div key={piece.position} className="w-full h-full anim-hop">
+                        <div className={`relative w-full h-full rounded-full border-2 border-white shadow-md flex items-center justify-center transition-transform ${COLOR_BG[piece.color]} ${selectable ? 'anim-selectable scale-125' : ''}`}>
+                          <CharacterSprite cls={player.characterClass} anim={spriteAnimOf(piece.id)} facing={facing[piece.id]} emojiSize="min(3.2vw, 16px)" />
+                          <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-[120%] h-1 bg-black/60 rounded-full overflow-hidden">
+                            <div className={`h-full ${hpColor} transition-all duration-300`} style={{ width: `${hpRatio * 100}%` }} />
+                          </div>
+                          <div className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 bg-black/70 px-1 rounded-full text-[6px] sm:text-[8px] font-bold text-yellow-300 whitespace-nowrap">
+                            ⚔{piece.attack}{piece.range > 0 ? ` 🎯${piece.range}` : ''}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}
+
+            {/* Effects layer */}
+            <div className="absolute inset-0 pointer-events-none z-[70]">
+              {effects.map(fx => {
+                if (fx.kind === 'projectile') {
+                  return (
+                    <div
+                      key={fx.id}
+                      className="absolute fx-projectile text-xl text-amber-300 drop-shadow-[0_0_6px_rgba(251,191,36,0.9)]"
+                      style={{ '--x1': `${fx.x}%`, '--y1': `${fx.y}%`, '--x2': `${fx.x2}%`, '--y2': `${fx.y2}%`, '--dur': `${PROJECTILE_MS / speed}ms`, transform: 'translate(-50%, -50%)' } as React.CSSProperties}
+                    >
+                      <div className={fx.spin ? 'fx-spin' : ''} style={fx.spin ? undefined : { transform: `rotate(${fx.angle}deg)` }}>{fx.text}</div>
+                    </div>
+                  );
+                }
+                if (fx.kind === 'ring') {
+                  return <div key={fx.id} className={`absolute fx-ring w-[7%] h-[7%] rounded-full border-4 ${fx.className}`} style={{ left: `${fx.x}%`, top: `${fx.y}%` }} />;
+                }
+                if (fx.kind === 'burst') {
+                  return <div key={fx.id} className="absolute fx-burst text-2xl" style={{ left: `${fx.x}%`, top: `${fx.y}%` }}>{fx.text}</div>;
+                }
+                return (
+                  <div key={fx.id} className={`absolute fx-float font-black whitespace-nowrap [text-shadow:0_2px_0_#000,0_0_6px_#000] ${fx.className}`} style={{ left: `${fx.x}%`, top: `${fx.y}%` }}>
+                    {fx.text}
+                  </div>
+                );
+              })}
+            </div>
+
           </div>
+
+          {phase === 'animating' && camera.zoom > 1 && (
+            <div className="absolute bottom-2 right-2 z-[75] pointer-events-none text-[10px] font-bold uppercase tracking-widest bg-black/60 text-white/80 px-2 py-1 rounded-md">Tap to skip</div>
+          )}
 
           {/* Turn banner */}
           {banner && (
@@ -519,9 +626,9 @@ export default function LudoGame() {
               </button>
             </div>
             <div className="flex items-center gap-2 mt-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-              Speed
-              {SPEEDS.map((s, i) => (
-                <button key={s} onClick={() => { setSpeedIdx(i); speedRef.current = s; }} className={`px-2 py-0.5 rounded-md ${i === speedIdx ? 'bg-yellow-400 text-slate-900' : 'bg-slate-700 text-slate-300'}`}>{s}x</button>
+              Anim
+              {(Object.keys(MODES) as AnimMode[]).map(m => (
+                <button key={m} onClick={() => changeMode(m)} className={`px-2 py-0.5 rounded-md normal-case tracking-normal ${m === mode ? 'bg-yellow-400 text-slate-900' : 'bg-slate-700 text-slate-300'}`}>{MODES[m].label}</button>
               ))}
             </div>
           </div>
