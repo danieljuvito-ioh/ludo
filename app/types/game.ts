@@ -1,5 +1,7 @@
 export type Color = 'red' | 'blue' | 'yellow' | 'green';
 
+export type CharacterClass = 'knight' | 'archer' | 'mage' | 'assassin';
+
 export type BuffType = 'HEAL' | 'ATTACK_RANGE' | 'SHIELD' | 'DOUBLE_DICE';
 
 export interface Buff {
@@ -11,8 +13,9 @@ export interface Buff {
 export interface Piece {
   id: string;
   color: Color;
-  position: number; // -1 for home, 0-51 for common path, 52-57 for home stretch, 100 for finished
+  position: number; // -1 for home, 0-51 for common path, 52-57 for home stretch, 57 is finished
   hp: number;
+  maxHp: number;
   attack: number;
   range: number;
   buffs: Buff[];
@@ -23,6 +26,7 @@ export interface Player {
   name: string;
   color: Color;
   isBot: boolean;
+  characterClass: CharacterClass;
   pieces: Piece[];
 }
 
@@ -32,6 +36,19 @@ export interface Tile {
   index: number;
   type: TileType;
 }
+
+export interface PieceStats {
+  hp: number;
+  maxHp: number;
+  attack: number;
+  range: number;
+}
+
+// Things that happen during a move, in order, so the UI can animate them one by one
+export type GameEvent =
+  | { type: 'buff'; pieceId: string; label: string; stats: PieceStats }
+  | { type: 'attack'; attackerId: string; targetId: string; damage: number; hpAfter: number; killed: boolean }
+  | { type: 'finish'; pieceId: string };
 
 export interface GameState {
   players: Player[];

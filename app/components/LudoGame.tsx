@@ -1,8 +1,47 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { Player, Piece, Color, GameState, BuffType } from '../types/game';
-import { createInitialPlayers, getGlobalIndex, BUFF_LOCATIONS, SAFE_ZONES, PlayerConfig, COLORS } from '../lib/game-logic';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Piece, Color, GameState } from '../types/game';
+import {
+  createInitialPlayers, getGlobalIndex, BUFF_LOCATIONS, SAFE_ZONES, START_POSITIONS, PlayerConfig, COLORS, FINISH, CELLS,
+  canMove, resolveMove, chooseBotMove, findPiece, getNextPlayerIndex, isPlayerFinished, getPieceCoords, cellCenter,
+} from '../lib/game-logic';
+import { CHARACTERS, CHARACTER_LIST } from '../lib/characters';
+import Die from './Die';
+import SetupScreen from './SetupScreen';
+import VictoryOverlay from './VictoryOverlay';
+
+type Phase = 'idle' | 'rolling' | 'choosing' | 'animating';
+type FocusData = { globalIdx: number; color?: Color; localPos?: number };
+type Effect =
+  | { id: number; kind: 'float'; x: number; y: number; text: string; className: string }
+  | { id: number; kind: 'burst'; x: number; y: number; text: string }
+  | { id: number; kind: 'ring'; x: number; y: number; className: string }
+  | { id: number; kind: 'projectile'; x: number; y: number; x2: number; y2: number; text: string; spin: boolean; angle: number };
+type WithoutId<T> = T extends unknown ? Omit<T, 'id'> : never;
+type NewEffect = WithoutId<Effect>;
+
+const COLOR_BG: Record<Color, string> = { red: 'bg-red-500', blue: 'bg-blue-500', yellow: 'bg-yellow-500', green: 'bg-green-500' };
+const COLOR_TILE: Record<Color, string> = { red: 'bg-red-400/25', blue: 'bg-blue-400/25', yellow: 'bg-yellow-400/25', green: 'bg-green-400/25' };
+const COLOR_STRETCH: Record<Color, string> = { red: 'bg-red-200', blue: 'bg-blue-200', yellow: 'bg-yellow-200', green: 'bg-green-200' };
+const COLOR_BASE: Record<Color, string> = { red: 'bg-red-500/20', blue: 'bg-blue-500/20', yellow: 'bg-yellow-500/20', green: 'bg-green-500/20' };
+const BASE_POSITION: Record<Color, string> = { red: 'top-0 left-0', blue: 'top-0 right-0', green: 'bottom-0 left-0', yellow: 'bottom-0 right-0' };
+
+const SPEEDS = [1, 2, 4];
+const STEP_MS = 220;
+const PROJECTILE_MS = 380;
+const LOG_SIZE = 12;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const initialGameState: GameState = {
+  players: [],
+  currentPlayerIndex: 0,
+  diceValue: 0,
+  isGameOver: false,
+  gameLog: ['Game started!'],
+  winners: [],
+};
 
 export default function LudoGame() {
   const [gameStarted, setGameStarted] = useState(false);
@@ -11,485 +50,498 @@ export default function LudoGame() {
       color,
       isBot: index !== 0,
       isActive: true,
+      characterClass: CHARACTER_LIST[index].id,
     }))
   );
 
-  const [gameState, setGameState] = useState<GameState>({
-    players: [],
-    currentPlayerIndex: 0,
-    diceValue: 0,
-    isGameOver: false,
-    gameLog: ['Game started!'],
-    winners: [],
-  });
-  const [isRolling, setIsRolling] = useState(false);
-  const [waitingForMove, setWaitingForMove] = useState(false);
-  const [selectedPieceId, setSelectedPieceId] = useState<string | null>(null);
-  const [focusedTile, setFocusedTile] = useState<{ globalIdx: number; color?: Color; localPos?: number } | null>(null);
-  const [attackingPieceId, setAttackingPieceId] = useState<string | null>(null);
-  const [focusTimer, setFocusTimer] = useState<NodeJS.Timeout | null>(null);
-  
-  // Pre-calculate range highlights to avoid heavy computation during render
-  const rangeHighlights = React.useMemo(() => {
-    const highlights: Record<number, Color> = {};
-    if (!gameStarted) return highlights;
+  const [gameState, setGameState] = useState<GameState>(initialGameState);
+  const [phase, setPhase] = useState<Phase>('idle');
+  const [rollingFace, setRollingFace] = useState(1);
+  const [focusedTile, setFocusedTile] = useState<FocusData | null>(null);
 
-    gameState.players.forEach(player => {
+  // Animation state: temporary visual overrides layered on top of the real game state
+  const [overrides, setOverrides] = useState<Record<string, Partial<Piece>>>({});
+  const [pieceAnims, setPieceAnims] = useState<Record<string, string>>({});
+  const [effects, setEffects] = useState<Effect[]>([]);
+  const [boardShaking, setBoardShaking] = useState(false);
+  const [banner, setBanner] = useState<{ key: number; text: string; emoji: string; color: Color } | null>(null);
+  const [speedIdx, setSpeedIdx] = useState(0);
+
+  const speedRef = useRef(1);
+  const busyRef = useRef(false);
+  const effectId = useRef(0);
+  const focusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const wait = useCallback((ms: number) => sleep(ms / speedRef.current), []);
+
+  const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+
+  const viewPlayers = useMemo(() => gameState.players.map(player => ({
+    ...player,
+    pieces: player.pieces.map(p => (overrides[p.id] ? { ...p, ...overrides[p.id] } : p)),
+  })), [gameState.players, overrides]);
+
+  // Pre-calculate range highlights to avoid heavy computation during render
+  const rangeHighlights = useMemo(() => {
+    const highlights: Record<number, Color> = {};
+    viewPlayers.forEach(player => {
       player.pieces.forEach(p => {
         if (p.position >= 0 && p.position < 52) {
           const pGlobal = getGlobalIndex(p.position, p.color);
-          // Only check nearby tiles to be efficient (max range is usually small)
-          const range = p.range;
-          for (let r = 1; r <= range; r++) {
-            const nextIdx = (pGlobal + r) % 52;
-            const prevIdx = (pGlobal - r + 52) % 52;
-            // Last one wins if overlapping, or we could handle it differently
-            highlights[nextIdx] = p.color;
-            highlights[prevIdx] = p.color;
+          for (let r = 1; r <= p.range; r++) {
+            // Last one wins if overlapping
+            highlights[(pGlobal + r) % 52] = p.color;
+            highlights[(pGlobal - r + 52) % 52] = p.color;
           }
         }
       });
     });
     return highlights;
-  }, [gameState.players, gameStarted]);
+  }, [viewPlayers]);
 
-  const currentPlayer = gameState.players[gameState.currentPlayerIndex] || { name: 'Player', color: 'red', pieces: [], isBot: false };
+  // Where each movable piece would land, so humans can see their options
+  const destinations = useMemo(() => {
+    const cells = new Set<string>();
+    if (phase !== 'choosing' || !currentPlayer || currentPlayer.isBot) return cells;
+    currentPlayer.pieces.forEach(p => {
+      if (!canMove(p, gameState.diceValue)) return;
+      const to = p.position === -1 ? 0 : p.position + gameState.diceValue;
+      cells.add(getPieceCoords(to, p.color).join(','));
+    });
+    return cells;
+  }, [phase, currentPlayer, gameState.diceValue]);
+
+  // ---- Animation helpers ----
+
+  const spawn = useCallback((effect: NewEffect, duration: number) => {
+    const id = ++effectId.current;
+    setEffects(prev => [...prev, { ...effect, id } as Effect]);
+    setTimeout(() => setEffects(prev => prev.filter(e => e.id !== id)), duration / speedRef.current);
+  }, []);
+
+  const flashPiece = useCallback((pieceId: string, className: string, duration: number) => {
+    setPieceAnims(prev => ({ ...prev, [pieceId]: className }));
+    setTimeout(() => setPieceAnims(prev => {
+      if (prev[pieceId] !== className) return prev;
+      const next = { ...prev };
+      delete next[pieceId];
+      return next;
+    }), duration / speedRef.current);
+  }, []);
+
+  const patchPiece = useCallback((pieceId: string, patch: Partial<Piece>) => {
+    setOverrides(prev => ({ ...prev, [pieceId]: { ...prev[pieceId], ...patch } }));
+  }, []);
+
+  const shakeBoard = useCallback(() => {
+    setBoardShaking(true);
+    setTimeout(() => setBoardShaking(false), 400 / speedRef.current);
+  }, []);
+
+  // ---- Focus (tile details) ----
+
+  const clearFocusTimer = () => {
+    if (focusTimer.current) clearTimeout(focusTimer.current);
+    focusTimer.current = null;
+  };
 
   const closeFocus = useCallback(() => {
-    if (focusTimer) clearTimeout(focusTimer);
-    const timer = setTimeout(() => {
-      setFocusedTile(null);
-    }, 800); // Increased to 800ms for more travel time
-    setFocusTimer(timer);
-  }, [focusTimer]);
+    clearFocusTimer();
+    focusTimer.current = setTimeout(() => setFocusedTile(null), 800); // travel time to reach the panel
+  }, []);
 
-  const keepFocus = useCallback(() => {
-    if (focusTimer) clearTimeout(focusTimer);
-    setFocusTimer(null);
-  }, [focusTimer]);
+  const openFocus = useCallback((data: FocusData) => {
+    clearFocusTimer();
+    setFocusedTile(prev =>
+      prev && prev.globalIdx === data.globalIdx && prev.color === data.color && prev.localPos === data.localPos ? prev : data
+    );
+  }, []);
 
-  const openFocus = useCallback((data: { globalIdx: number; color?: Color; localPos?: number }) => {
-    // If it's the same tile, just clear the closing timer
-    if (focusedTile && 
-        focusedTile.globalIdx === data.globalIdx && 
-        focusedTile.color === data.color && 
-        focusedTile.localPos === data.localPos) {
-      if (focusTimer) clearTimeout(focusTimer);
-      setFocusTimer(null);
-      return;
-    }
-    
-    if (focusTimer) clearTimeout(focusTimer);
-    setFocusedTile(data);
-    setFocusTimer(null);
-  }, [focusTimer, focusedTile]);
+  const focusHandlers = (data: FocusData, hasPiece: () => boolean) => {
+    const open = () => { if (hasPiece()) openFocus(data); };
+    return { onMouseEnter: open, onMouseDown: open, onTouchStart: open, onMouseLeave: closeFocus, onMouseUp: closeFocus, onTouchEnd: closeFocus };
+  };
+
+  const focusDataFor = (piece: Piece): FocusData =>
+    piece.position >= 52 ? { globalIdx: 0, color: piece.color, localPos: piece.position } : { globalIdx: getGlobalIndex(piece.position, piece.color) };
+
+  // ---- Game flow ----
+
+  const startGame = () => {
+    const players = createInitialPlayers(playerConfigs);
+    setGameState({ ...initialGameState, players, gameLog: [`Game started! ${players[0].name} turn.`] });
+    setOverrides({});
+    setPhase('idle');
+    busyRef.current = false;
+    setGameStarted(true);
+  };
 
   const rollDice = useCallback(() => {
-    if (isRolling || waitingForMove || gameState.isGameOver) return;
+    if (phase !== 'idle' || gameState.isGameOver || busyRef.current) return;
+    busyRef.current = true;
+    setPhase('rolling');
 
-    // Check if current player is already finished (all pieces at 57)
-    const isCurrentPlayerFinished = currentPlayer.pieces.every(p => p.position === 57);
-    if (isCurrentPlayerFinished) {
+    const player = gameState.players[gameState.currentPlayerIndex];
+    const interval = setInterval(() => setRollingFace(Math.floor(Math.random() * 6) + 1), 70);
+
+    setTimeout(() => {
+      clearInterval(interval);
+      const value = Math.floor(Math.random() * 6) + 1;
       setGameState(prev => ({
         ...prev,
-        currentPlayerIndex: (prev.currentPlayerIndex + 1) % prev.players.length
-      }));
-      return;
-    }
-
-    setIsRolling(true);
-    setSelectedPieceId(null);
-    
-    setTimeout(() => {
-      const newVal = Math.floor(Math.random() * 6) + 1;
-      setIsRolling(false);
-      setGameState(prev => ({ 
-        ...prev, 
-        diceValue: newVal,
-        gameLog: [`${currentPlayer.name} rolled a ${newVal}`, ...prev.gameLog].slice(0, 10)
+        diceValue: value,
+        gameLog: [`${player.name} rolled a ${value}`, ...prev.gameLog].slice(0, LOG_SIZE),
       }));
 
-      const canMove = currentPlayer.pieces.some(p => {
-        if (p.position === -1 && newVal === 6) return true;
-        if (p.position >= 0 && p.position + newVal <= 57) return true;
-        return false;
-      });
-
-      if (!canMove) {
-        setGameState(prev => {
-          let nextIndex = (prev.currentPlayerIndex + 1) % prev.players.length;
-          // Skip finished players
-          while (prev.players[nextIndex].pieces.every(p => p.position === 57)) {
-            nextIndex = (nextIndex + 1) % prev.players.length;
-            if (nextIndex === prev.currentPlayerIndex) break; // Avoid infinite loop
-          }
-          return {
-            ...prev,
-            gameLog: [`No possible moves for ${currentPlayer.name}`, ...prev.gameLog].slice(0, 10),
-            currentPlayerIndex: nextIndex
-          };
-        });
-      } else {
-        setWaitingForMove(true);
+      if (player.pieces.some(p => canMove(p, value))) {
+        setPhase('choosing');
+        busyRef.current = false;
+        return;
       }
-    }, 600);
-  }, [isRolling, waitingForMove, currentPlayer, gameState.currentPlayerIndex, gameState.players.length, gameState.isGameOver]);
 
-  const movePiece = (pieceId: string) => {
-    if (!waitingForMove) return;
+      setPhase('animating');
+      setTimeout(() => {
+        setGameState(prev => ({
+          ...prev,
+          diceValue: 0,
+          currentPlayerIndex: getNextPlayerIndex(prev.players, prev.currentPlayerIndex),
+          gameLog: [`No possible moves for ${player.name}`, ...prev.gameLog].slice(0, LOG_SIZE),
+        }));
+        setPhase('idle');
+        busyRef.current = false;
+      }, 800 / speedRef.current);
+    }, 650 / speedRef.current);
+  }, [phase, gameState.isGameOver, gameState.players, gameState.currentPlayerIndex]);
 
+  const movePiece = useCallback(async (pieceId: string) => {
+    if (phase !== 'choosing' || busyRef.current) return;
     const playerIndex = gameState.currentPlayerIndex;
-    const player = gameState.players[playerIndex];
-    const pieceIndex = player.pieces.findIndex(p => p.id === pieceId);
-    if (pieceIndex === -1) return;
-    
-    const piece = player.pieces[pieceIndex];
     const roll = gameState.diceValue;
+    const before = gameState.players;
+    const result = resolveMove(before, playerIndex, pieceId, roll);
+    if (!result) return;
 
-    let newPos = piece.position;
-    if (piece.position === -1) {
-      if (roll === 6) newPos = 0;
-      else return;
-    } else {
-      if (piece.position + roll > 57) return;
-      newPos += roll;
+    busyRef.current = true;
+    setPhase('animating');
+    setFocusedTile(null);
+
+    const player = before[playerIndex];
+    const def = CHARACTERS[player.characterClass];
+    const moverXY = cellCenter(getPieceCoords(result.to, player.color));
+
+    // 1. Walk tile by tile
+    for (const pos of result.path) {
+      patchPiece(pieceId, { position: pos });
+      await wait(STEP_MS);
+    }
+    if (result.from === -1) {
+      spawn({ kind: 'ring', ...moverXY, className: 'border-white' }, 600);
+      await wait(200);
     }
 
-    const globalIdx = getGlobalIndex(newPos, piece.color);
-    let updatedPiece = { ...piece, position: newPos };
-    let newLog = [`${player.name} moved piece to ${newPos}`];
+    // 2. Play buffs and attacks in order
+    for (const ev of result.events) {
+      if (ev.type === 'buff') {
+        patchPiece(ev.pieceId, ev.stats);
+        spawn({ kind: 'ring', ...moverXY, className: 'border-yellow-300' }, 600);
+        spawn({ kind: 'burst', ...moverXY, text: '✨' }, 500);
+        spawn({ kind: 'float', ...moverXY, text: ev.label, className: 'text-emerald-300' }, 900);
+        await wait(600);
+      } else if (ev.type === 'attack') {
+        const target = findPiece(before, ev.targetId)!;
+        const targetXY = cellCenter(getPieceCoords(target.piece.position, target.piece.color));
+        const melee = targetXY.x === moverXY.x && targetXY.y === moverXY.y;
 
-    setSelectedPieceId(piece.id);
-
-    if (newPos >= 0 && newPos < 52) {
-      const buffType = BUFF_LOCATIONS[globalIdx];
-      if (buffType) {
-        if (buffType === 'BUFF_HEAL') {
-          updatedPiece.hp += 1;
-          newLog.push(`✨ Piece healed! HP: ${updatedPiece.hp}`);
-        } else if (buffType === 'BUFF_ATTACK') {
-          updatedPiece.attack += 1;
-          newLog.push(`⚔️ Attack increased! Damage: ${updatedPiece.attack}`);
-        } else if (buffType === 'BUFF_RANGE') {
-          updatedPiece.range += 1;
-          newLog.push(`🎯 Range increased! Range: ${updatedPiece.range}`);
-        }
-      }
-    }
-
-    let updatedPlayers = JSON.parse(JSON.stringify(gameState.players));
-    updatedPlayers[playerIndex].pieces[pieceIndex] = updatedPiece;
-
-    const currentGlobal = getGlobalIndex(newPos, piece.color);
-    if (newPos >= 0 && newPos < 52) {
-      updatedPlayers.forEach((p: Player, pIdx: number) => {
-        if (pIdx === playerIndex) return;
-        
-        p.pieces.forEach((otherPiece: Piece) => {
-          if (otherPiece.position < 0 || otherPiece.position >= 52) return;
-          
-          const otherGlobal = getGlobalIndex(otherPiece.position, otherPiece.color);
-          const dist = Math.abs(currentGlobal - otherGlobal);
-          const circularDist = Math.min(dist, 52 - dist);
-          
-          if (circularDist <= updatedPiece.range || otherGlobal === currentGlobal) {
-            if (SAFE_ZONES.includes(otherGlobal)) return;
-
-            let damage = updatedPiece.attack;
-            if (damage > 0) {
-              setAttackingPieceId(piece.id);
-              setTimeout(() => setAttackingPieceId(null), 800);
-
-              otherPiece.hp -= damage;
-              if (otherPiece.hp <= 0) {
-                otherPiece.hp = 1;
-                otherPiece.attack = 1;
-                otherPiece.range = 0;
-                otherPiece.position = -1;
-                newLog.push(`💥 ${p.name}'s piece was defeated!`);
-              } else {
-                newLog.push(`⚔️ ${p.name}'s piece took ${damage} damage. HP: ${otherPiece.hp}`);
-              }
-            }
-          }
-        });
-      });
-    }
-
-    const isPlayerFinished = updatedPlayers[playerIndex].pieces.every((p: Piece) => p.position === 57);
-    let newWinners = [...gameState.winners];
-    if (isPlayerFinished && !newWinners.includes(player.name)) {
-      newWinners.push(player.name);
-      newLog.push(`🏆 ${player.name} has finished!`);
-    }
-
-    const activePlayersCount = updatedPlayers.filter((p: Player) => !p.pieces.every(pc => pc.position === 57)).length;
-    const isGameOver = activePlayersCount <= 1;
-
-    setGameState(prev => {
-      const nextPlayerIndex = (prev.currentPlayerIndex + 1) % prev.players.length;
-      let finalNextIndex = nextPlayerIndex;
-      if (!isGameOver) {
-        while (updatedPlayers[finalNextIndex].pieces.every((p: Piece) => p.position === 57)) {
-          finalNextIndex = (finalNextIndex + 1) % prev.players.length;
-        }
-      }
-
-      return {
-        ...prev,
-        players: updatedPlayers,
-        currentPlayerIndex: roll === 6 && !isPlayerFinished ? prev.currentPlayerIndex : finalNextIndex,
-        diceValue: 0,
-        gameLog: [...newLog, ...prev.gameLog].slice(0, 10),
-        winners: newWinners,
-        isGameOver: isGameOver
-      };
-    });
-    
-    setWaitingForMove(false);
-  };
-
-  useEffect(() => {
-    if (gameStarted && currentPlayer && (currentPlayer.isBot && !isRolling && !waitingForMove && !gameState.isGameOver)) {
-      const timer = setTimeout(rollDice, 1000);
-      return () => clearTimeout(timer);
-    }
-  }, [gameStarted, currentPlayer, isRolling, waitingForMove, gameState.isGameOver, rollDice]);
-
-  useEffect(() => {
-    if (gameStarted && currentPlayer && currentPlayer.isBot && waitingForMove && !gameState.isGameOver) {
-      const timer = setTimeout(() => {
-        const moveablePieces = currentPlayer.pieces.filter(p => {
-          if (p.position === -1 && gameState.diceValue === 6) return true;
-          if (p.position >= 0 && p.position + gameState.diceValue <= 57) return true;
-          return false;
-        });
-        if (moveablePieces.length > 0) {
-          movePiece(moveablePieces[0].id);
+        flashPiece(ev.attackerId, 'anim-attack', 350);
+        if (melee) {
+          await wait(180);
         } else {
-          setWaitingForMove(false);
-          setGameState(prev => {
-            let nextIndex = (prev.currentPlayerIndex + 1) % prev.players.length;
-            while (prev.players[nextIndex].pieces.every(p => p.position === 57)) {
-              nextIndex = (nextIndex + 1) % prev.players.length;
-            }
-            return { ...prev, currentPlayerIndex: nextIndex };
-          });
+          const angle = (Math.atan2(targetXY.y - moverXY.y, targetXY.x - moverXY.x) * 180) / Math.PI;
+          spawn({ kind: 'projectile', ...moverXY, x2: targetXY.x, y2: targetXY.y, text: def.projectile, spin: def.spinProjectile, angle }, PROJECTILE_MS);
+          await wait(PROJECTILE_MS);
         }
-      }, 1000);
+
+        spawn({ kind: 'burst', ...targetXY, text: melee ? '⚔️' : '💥' }, 500);
+        spawn({ kind: 'float', ...targetXY, text: `-${ev.damage}`, className: 'text-red-500 text-2xl' }, 900);
+        flashPiece(ev.targetId, 'anim-hit', 450);
+        patchPiece(ev.targetId, { hp: ev.hpAfter });
+        if (ev.killed || ev.damage >= 2) shakeBoard();
+        await wait(500);
+
+        if (ev.killed) {
+          flashPiece(ev.targetId, 'anim-die', 650);
+          spawn({ kind: 'float', ...targetXY, text: '💀', className: 'text-3xl' }, 900);
+          await wait(600);
+          const reset = findPiece(result.players, ev.targetId)!.piece;
+          patchPiece(ev.targetId, { position: -1, hp: reset.hp, maxHp: reset.maxHp, attack: reset.attack, range: reset.range });
+          await wait(150);
+        }
+      } else if (ev.type === 'finish') {
+        spawn({ kind: 'ring', ...moverXY, className: 'border-yellow-400' }, 600);
+        spawn({ kind: 'burst', ...moverXY, text: '👑' }, 500);
+        spawn({ kind: 'float', ...moverXY, text: 'FINISH!', className: 'text-yellow-300 text-lg' }, 900);
+        await wait(800);
+      }
+    }
+
+    // 3. Commit the resolved state
+    const finished = isPlayerFinished(result.players[playerIndex]);
+    const winners = finished && !gameState.winners.includes(player.name) ? [...gameState.winners, player.name] : gameState.winners;
+    const isGameOver = result.players.filter(p => !isPlayerFinished(p)).length <= 1;
+    const extraTurn = roll === 6 && !finished;
+    const log = [...result.log];
+    if (finished) log.push(`🏆 ${player.name} has finished!`);
+    if (extraTurn && !isGameOver) log.push('🎲 Rolled a 6, roll again!');
+
+    setGameState(prev => ({
+      ...prev,
+      players: result.players,
+      currentPlayerIndex: extraTurn || isGameOver ? prev.currentPlayerIndex : getNextPlayerIndex(result.players, prev.currentPlayerIndex),
+      diceValue: 0,
+      gameLog: [...log, ...prev.gameLog].slice(0, LOG_SIZE),
+      winners,
+      isGameOver,
+    }));
+    setOverrides({});
+    setPhase('idle');
+    busyRef.current = false;
+  }, [phase, gameState, wait, spawn, flashPiece, patchPiece, shakeBoard]);
+
+  // Turn banner whenever the active player changes
+  useEffect(() => {
+    if (!gameStarted || !currentPlayer || gameState.isGameOver) return;
+    setBanner({ key: Date.now(), text: `${currentPlayer.name}'s turn`, emoji: CHARACTERS[currentPlayer.characterClass].emoji, color: currentPlayer.color });
+    const timer = setTimeout(() => setBanner(null), 1300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameStarted, gameState.currentPlayerIndex, gameState.isGameOver]);
+
+  // Bot turns
+  useEffect(() => {
+    if (!gameStarted || gameState.isGameOver || !currentPlayer?.isBot) return;
+    if (phase === 'idle') {
+      const timer = setTimeout(rollDice, 700 / speedRef.current);
       return () => clearTimeout(timer);
     }
-  }, [currentPlayer?.isBot, waitingForMove, gameState.diceValue, gameStarted, gameState.isGameOver, movePiece, currentPlayer?.pieces, gameState.players.length]);
-
-  const getTileCoords = (globalIdx: number, color?: Color, localPos?: number) => {
-    if (localPos !== undefined && localPos >= 52 && localPos < 58) {
-      const step = localPos - 52;
-      if (color === 'red') return [7, 1 + step];
-      if (color === 'blue') return [1 + step, 7];
-      if (color === 'yellow') return [7, 13 - step];
-      if (color === 'green') return [13 - step, 7];
+    if (phase === 'choosing') {
+      const timer = setTimeout(() => {
+        const pieceId = chooseBotMove(gameState.players, gameState.currentPlayerIndex, gameState.diceValue);
+        if (pieceId) void movePiece(pieceId);
+      }, 500 / speedRef.current);
+      return () => clearTimeout(timer);
     }
-    
-    if (globalIdx === -1) return [0, 0];
-
-    const path = [
-      [6,1], [6,2], [6,3], [6,4], [6,5], [5,6], [4,6], [3,6], [2,6], [1,6], [0,6], [0,7], [0,8], [1,8], [2,8], [3,8], [4,8], [5,8], [6,9], [6,10], [6,11], [6,12], [6,13], [6,14], [7,14], [8,14], [8,13], [8,12], [8,11], [8,10], [8,9], [9,8], [10,8], [11,8], [12,8], [13,8], [14,8], [14,7], [14,6], [13,6], [12,6], [11,6], [10,6], [9,6], [8,5], [8,4], [8,3], [8,2], [8,1], [8,0], [7,0], [6,0]
-    ];
-    
-    return path[globalIdx % 52] || [7, 7];
-  };
+  }, [gameStarted, gameState, currentPlayer, phase, rollDice, movePiece]);
 
   if (!gameStarted) {
-    return (
-      <div className="flex flex-col items-center justify-center p-4 sm:p-8 bg-slate-900 min-h-screen text-white font-sans">
-        <h1 className="text-3xl sm:text-5xl font-black mb-6 sm:mb-8 text-yellow-400 uppercase tracking-tighter text-center">Ludo RPG Setup</h1>
-        <div className="bg-slate-800 border-2 border-slate-700 p-6 sm:p-8 rounded-3xl shadow-2xl max-w-lg w-full">
-          <div className="space-y-4 mb-8">
-            {playerConfigs.map((config, index) => (
-              <div key={config.color} className="flex items-center gap-3 sm:gap-4 p-3 sm:p-4 bg-slate-900/50 rounded-2xl border border-slate-700">
-                <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full border-4 border-white/20 ${config.color === 'red' ? 'bg-red-500' : config.color === 'blue' ? 'bg-blue-500' : config.color === 'yellow' ? 'bg-yellow-500' : 'bg-green-500'}`} />
-                <div className="flex-1">
-                  <div className="font-black uppercase text-[10px] sm:text-xs tracking-tighter">{config.color}</div>
-                  <div className="flex gap-1 sm:gap-2 mt-1">
-                    <button onClick={() => { const n = [...playerConfigs]; n[index].isBot = false; n[index].isActive = true; setPlayerConfigs(n); }} className={`px-2 py-1 rounded-lg text-[8px] sm:text-[10px] font-bold ${!config.isBot && config.isActive ? 'bg-indigo-600 text-white' : 'bg-slate-700 text-slate-400'}`}>HUMAN</button>
-                    <button onClick={() => { const n = [...playerConfigs]; n[index].isBot = true; n[index].isActive = true; setPlayerConfigs(n); }} className={`px-2 py-1 rounded-lg text-[8px] sm:text-[10px] font-bold ${config.isBot && config.isActive ? 'bg-indigo-600 text-white' : 'bg-slate-700 text-slate-400'}`}>BOT</button>
-                    <button onClick={() => { const n = [...playerConfigs]; n[index].isActive = !n[index].isActive; setPlayerConfigs(n); }} className={`px-2 py-1 rounded-lg text-[8px] sm:text-[10px] font-bold ${!config.isActive ? 'bg-red-600 text-white' : 'bg-slate-700 text-slate-400'}`}>{config.isActive ? 'ON' : 'OFF'}</button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-          <button disabled={playerConfigs.filter(c => c.isActive).length < 2} onClick={() => { const ap = createInitialPlayers(playerConfigs); setGameState(prev => ({ ...prev, players: ap, currentPlayerIndex: 0, isGameOver: false, winners: [], gameLog: [`Game started! ${ap[0].name} turn.`] })); setGameStarted(true); }} className="w-full py-4 bg-yellow-400 hover:bg-yellow-300 disabled:bg-slate-700 text-slate-900 font-black rounded-2xl transition-all shadow-xl uppercase tracking-tighter text-xl">Start Game</button>
-        </div>
-      </div>
-    );
+    return <SetupScreen configs={playerConfigs} onChange={setPlayerConfigs} onStart={startGame} />;
   }
 
+  const speed = SPEEDS[speedIdx];
+  const isHumanTurn = currentPlayer && !currentPlayer.isBot;
+  const viewCurrent = viewPlayers[gameState.currentPlayerIndex];
+  const canMoveNow = (piece: Piece) =>
+    phase === 'choosing' && isHumanTurn && piece.color === currentPlayer.color && canMove(piece, gameState.diceValue);
+
+  // Stack pieces sharing a tile side by side
+  const boardPieces = viewPlayers.flatMap(player => player.pieces.filter(p => p.position >= 0 && p.position <= FINISH).map(piece => ({ piece, player })));
+  const stackCount: Record<string, number> = {};
+  boardPieces.forEach(({ piece }) => { const k = getPieceCoords(piece.position, piece.color).join(','); stackCount[k] = (stackCount[k] ?? 0) + 1; });
+  const stackSeen: Record<string, number> = {};
+
   return (
-    <div className="flex flex-col items-center p-2 sm:p-4 bg-slate-900 min-h-screen text-white font-sans overflow-x-hidden">
-      <h1 className="text-2xl sm:text-4xl font-bold mb-4 text-yellow-400 uppercase tracking-tighter">Ludo RPG: Lite</h1>
-      <div className="flex flex-col lg:flex-row gap-4 items-center lg:items-start w-full max-w-6xl">
+    <div className="flex flex-col items-center p-2 sm:p-4 bg-slate-900 min-h-screen text-white font-sans overflow-x-hidden" style={{ '--speed': speed } as React.CSSProperties}>
+      <h1 className="text-2xl sm:text-4xl font-bold mb-4 text-yellow-400 uppercase tracking-tighter">Ludo RPG</h1>
+      <div className="flex flex-col lg:flex-row gap-4 items-center lg:items-start w-full max-w-6xl justify-center">
         {/* BOARD */}
-        <div className="relative w-full max-w-[450px] aspect-square bg-white border-4 sm:border-8 border-slate-700 shadow-2xl rounded-lg overflow-hidden touch-none">
+        <div className={`relative w-full max-w-[480px] aspect-square bg-white border-4 sm:border-8 border-slate-700 shadow-2xl rounded-lg overflow-hidden touch-none ${boardShaking ? 'anim-board-shake' : ''}`}>
           <div className="grid grid-cols-15 grid-rows-15 w-full h-full text-slate-800" style={{ fontSize: 'min(2vw, 12px)' }}>
-            {Array.from({ length: 225 }).map((_, i) => {
-              const row = Math.floor(i / 15), col = i % 15;
-              let bgColor = 'bg-transparent', content = null;
-              if (row < 6 && col < 6) bgColor = 'bg-red-500/20';
-              else if (row < 6 && col > 8) bgColor = 'bg-blue-500/20';
-              else if (row > 8 && col < 6) bgColor = 'bg-green-500/20';
-              else if (row > 8 && col > 8) bgColor = 'bg-yellow-500/20';
-              else if (row >= 6 && row <= 8 && col >= 6 && col <= 8) bgColor = 'bg-slate-200';
+            {CELLS.map((cell, i) => {
+              const key = `${Math.floor(i / 15)},${i % 15}`;
+              const isDestination = destinations.has(key);
+              const destRing = isDestination ? 'ring-2 ring-inset ring-yellow-400 animate-pulse' : '';
 
-              // Highlight range for all pieces (using pre-calculated values)
-              let rangeHighlightColor: Color | null = null;
-              
-              let pathIdx = -1;
-              for (let g = 0; g < 52; g++) {
-                const [tr, tc] = getTileCoords(g);
-                if (tr === row && tc === col) { pathIdx = g; break; }
-              }
-
-              if (pathIdx !== -1 && rangeHighlights[pathIdx]) {
-                rangeHighlightColor = rangeHighlights[pathIdx];
-              }
-
-              if (pathIdx !== -1) {
-                bgColor = 'bg-slate-50 border border-slate-200';
-                
-                if (rangeHighlightColor) {
-                  const colorMap = { red: 'bg-red-400/20', blue: 'bg-blue-400/20', yellow: 'bg-yellow-400/20', green: 'bg-green-400/20' };
-                  bgColor = `${colorMap[rangeHighlightColor]} animate-pulse`;
-                  content = <div className={`w-1.5 h-1.5 rounded-full opacity-40 ${rangeHighlightColor === 'red' ? 'bg-red-500' : rangeHighlightColor === 'blue' ? 'bg-blue-500' : rangeHighlightColor === 'yellow' ? 'bg-yellow-500' : 'bg-green-500'}`} />;
+              if (cell.kind === 'path') {
+                const idx = cell.idx;
+                const highlight = rangeHighlights[idx];
+                const startColor = COLORS.find(c => START_POSITIONS[c] === idx);
+                let bgColor = startColor ? COLOR_TILE[startColor] : 'bg-slate-50';
+                let content: React.ReactNode = null;
+                if (highlight) {
+                  bgColor = `${COLOR_TILE[highlight]} animate-pulse`;
+                  content = <div className={`w-1.5 h-1.5 rounded-full opacity-40 ${COLOR_BG[highlight]}`} />;
                 }
-                const buff = BUFF_LOCATIONS[pathIdx];
+                const buff = BUFF_LOCATIONS[idx];
                 if (buff === 'BUFF_HEAL') content = <span className="text-pink-500">♥</span>;
                 else if (buff === 'BUFF_ATTACK') content = <span className="text-orange-500">⚔</span>;
                 else if (buff === 'BUFF_RANGE') content = <span className="text-blue-500">🎯</span>;
-                if (SAFE_ZONES.includes(pathIdx)) { bgColor = 'bg-slate-200'; content = <span className="text-slate-400 opacity-30">★</span>; }
+                if (SAFE_ZONES.includes(idx)) {
+                  if (!startColor) bgColor = 'bg-slate-200';
+                  content = <span className="text-slate-400 opacity-40">★</span>;
+                }
+                const hasPiece = () => viewPlayers.some(pl => pl.pieces.some(p => p.position >= 0 && p.position < 52 && getGlobalIndex(p.position, p.color) === idx));
                 return (
-                  <div 
-                    key={i} 
-                    onMouseEnter={() => {
-                      const hasPiece = gameState.players.some(player => player.pieces.some(p => getGlobalIndex(p.position, p.color) === pathIdx && p.position < 52 && p.position >= 0));
-                      if (hasPiece) openFocus({ globalIdx: pathIdx });
-                    }}
-                    onMouseLeave={closeFocus}
-                    onMouseDown={() => {
-                      const hasPiece = gameState.players.some(player => player.pieces.some(p => getGlobalIndex(p.position, p.color) === pathIdx && p.position < 52 && p.position >= 0));
-                      if (hasPiece) openFocus({ globalIdx: pathIdx });
-                    }}
-                    onMouseUp={closeFocus}
-                    onTouchStart={() => {
-                      const hasPiece = gameState.players.some(player => player.pieces.some(p => getGlobalIndex(p.position, p.color) === pathIdx && p.position < 52 && p.position >= 0));
-                      if (hasPiece) openFocus({ globalIdx: pathIdx });
-                    }}
-                    onTouchEnd={closeFocus}
-                    className={`${bgColor} flex items-center justify-center cursor-pointer select-none`}
-                  >
+                  <div key={i} {...focusHandlers({ globalIdx: idx }, hasPiece)} className={`${bgColor} ${destRing} border border-slate-200 flex items-center justify-center cursor-pointer select-none`}>
                     {content}
                   </div>
                 );
               }
 
-              for (const color of ['red', 'blue', 'yellow', 'green'] as Color[]) {
-                for (let lp = 52; lp < 58; lp++) {
-                  const [tr, tc] = getTileCoords(0, color, lp);
-                  if (tr === row && tc === col) {
-                    bgColor = color === 'red' ? 'bg-red-100' : color === 'blue' ? 'bg-blue-100' : color === 'yellow' ? 'bg-yellow-100' : 'bg-green-100';
-                    return (
-                      <div 
-                        key={i} 
-                        onMouseEnter={() => {
-                          const hasPiece = gameState.players.some(player => player.pieces.some(p => p.color === color && p.position === lp));
-                          if (hasPiece) openFocus({ globalIdx: 0, color, localPos: lp });
-                        }}
-                        onMouseLeave={closeFocus}
-                        onMouseDown={() => {
-                          const hasPiece = gameState.players.some(player => player.pieces.some(p => p.color === color && p.position === lp));
-                          if (hasPiece) openFocus({ globalIdx: 0, color, localPos: lp });
-                        }}
-                        onMouseUp={closeFocus}
-                        onTouchStart={() => {
-                          const hasPiece = gameState.players.some(player => player.pieces.some(p => p.color === color && p.position === lp));
-                          if (hasPiece) openFocus({ globalIdx: 0, color, localPos: lp });
-                        }}
-                        onTouchEnd={closeFocus}
-                        className={`${bgColor} flex items-center justify-center cursor-pointer border border-white/20 select-none`}
-                      >
-                        {content}
-                      </div>
-                    );
-                  }
-                }
+              if (cell.kind === 'stretch') {
+                const { color, localPos } = cell;
+                const hasPiece = () => viewPlayers.some(pl => pl.pieces.some(p => p.color === color && p.position === localPos));
+                return (
+                  <div key={i} {...focusHandlers({ globalIdx: 0, color, localPos }, hasPiece)} className={`${COLOR_STRETCH[color]} ${destRing} flex items-center justify-center cursor-pointer border border-white/40 select-none`}>
+                    {localPos === FINISH && <span className="opacity-60">👑</span>}
+                  </div>
+                );
               }
-              return <div key={i} className={`${bgColor} flex items-center justify-center`}>{content}</div>;
+
+              if (cell.kind === 'base') return <div key={i} className={COLOR_BASE[cell.color]} />;
+              if (cell.kind === 'center') return <div key={i} className="bg-slate-300" />;
+              return <div key={i} />;
             })}
           </div>
 
-          {/* Home Boxes Pieces */}
-          {gameState.players.map((p, pIdx) => (
-            <div key={p.color} className={`absolute w-[40%] h-[40%] flex items-center justify-center pointer-events-none ${p.color === 'red' ? 'top-0 left-0' : p.color === 'blue' ? 'top-0 right-0' : p.color === 'green' ? 'bottom-0 left-0' : 'bottom-0 right-0'}`}>
+          {/* Home bases */}
+          {viewPlayers.map(p => (
+            <div key={p.color} className={`absolute w-[40%] h-[40%] flex items-center justify-center pointer-events-none ${BASE_POSITION[p.color]}`}>
+              <span className="absolute text-[64px] sm:text-[88px] opacity-15 select-none">{CHARACTERS[p.characterClass].emoji}</span>
               <div className="grid grid-cols-2 gap-2 pointer-events-auto">
-                {p.pieces.filter(pc => pc.position === -1).map(pc => (
-                  <div key={pc.id} onClick={() => movePiece(pc.id)} className={`w-8 h-8 sm:w-10 sm:h-10 rounded-full border-2 sm:border-4 border-white cursor-pointer shadow-xl flex items-center justify-center text-white font-bold text-xs sm:text-base ${p.color === 'red' ? 'bg-red-600' : p.color === 'blue' ? 'bg-blue-600' : p.color === 'green' ? 'bg-green-600' : 'bg-yellow-500'}`}>P</div>
-                ))}
+                {p.pieces.filter(pc => pc.position === -1).map(pc => {
+                  const selectable = canMoveNow(pc);
+                  return (
+                    <div
+                      key={pc.id}
+                      onClick={() => { if (selectable) void movePiece(pc.id); }}
+                      className={`anim-pop-in w-8 h-8 sm:w-10 sm:h-10 rounded-full border-2 sm:border-4 border-white shadow-xl flex items-center justify-center text-base sm:text-xl ${COLOR_BG[p.color]} ${selectable ? 'anim-selectable cursor-pointer scale-110' : ''} transition-transform`}
+                    >
+                      <span className={selectable ? 'anim-idle' : ''}>{CHARACTERS[p.characterClass].emoji}</span>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           ))}
 
-          {/* Active Pieces */}
-          {gameState.players.flatMap(player => player.pieces.filter(p => p.position >= 0 && p.position < 58).map(piece => {
-            const [row, col] = getTileCoords(getGlobalIndex(piece.position, piece.color), piece.color, piece.position);
-            const isCurrentPlayerPiece = currentPlayer.color === piece.color;
-            const isAttacking = attackingPieceId === piece.id;
-            const canMoveThisPiece = isCurrentPlayerPiece && waitingForMove && (
-              (piece.position === -1 && gameState.diceValue === 6) ||
-              (piece.position >= 0 && piece.position + gameState.diceValue <= 57)
-            );
-            
+          {/* Pieces on the board */}
+          {boardPieces.map(({ piece, player }) => {
+            const coords = getPieceCoords(piece.position, piece.color);
+            const k = coords.join(',');
+            const stackIdx = stackSeen[k] = (stackSeen[k] ?? -1) + 1;
+            const { x, y } = cellCenter(coords);
+            const offset = (stackIdx - (stackCount[k] - 1) / 2) * 2;
+            const selectable = canMoveNow(piece);
+            const hpRatio = piece.hp / Math.max(piece.maxHp, piece.hp);
+            const hpColor = hpRatio > 0.66 ? 'bg-green-400' : hpRatio > 0.34 ? 'bg-yellow-400' : 'bg-red-500';
+            const transition = `${STEP_MS / speed * 0.8}ms`;
+
             return (
-              <div key={piece.id} 
-                onMouseEnter={() => { openFocus(piece.position >= 52 ? { globalIdx: 0, color: piece.color, localPos: piece.position } : { globalIdx: getGlobalIndex(piece.position, piece.color) }); }}
-                onMouseLeave={closeFocus}
-                onMouseDown={() => { openFocus(piece.position >= 52 ? { globalIdx: 0, color: piece.color, localPos: piece.position } : { globalIdx: getGlobalIndex(piece.position, piece.color) }); }}
-                onMouseUp={closeFocus}
-                onTouchStart={() => { openFocus(piece.position >= 52 ? { globalIdx: 0, color: piece.color, localPos: piece.position } : { globalIdx: getGlobalIndex(piece.position, piece.color) }); }}
-                onTouchEnd={closeFocus}
-                onClick={() => { if (canMoveThisPiece) movePiece(piece.id); }}
-                className={`absolute w-[5.33%] h-[5.33%] rounded-full border border-white flex items-center justify-center cursor-pointer shadow-md transition-all duration-200 ${canMoveThisPiece ? 'z-50 scale-125 border-yellow-400 border-2' : 'z-20'} ${piece.color === 'red' ? 'bg-red-500' : piece.color === 'blue' ? 'bg-blue-500' : piece.color === 'yellow' ? 'bg-yellow-500' : piece.color === 'green' ? 'bg-green-500' : 'bg-slate-500'}`}
-                style={{ left: `${(col / 15) * 100 + 3.33}%`, top: `${(row / 15) * 100 + 3.33}%`, transform: 'translate(-50%, -50%)' }}>
-                <span className="text-[8px] sm:text-[10px] font-black text-white">{piece.hp}</span>
-                <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 bg-black/60 px-1 rounded-full text-[6px] sm:text-[8px] font-bold text-yellow-300 flex items-center gap-0.5">
-                  ⚔️{piece.attack}
-                </div>
-                {isAttacking && (
-                  <div className="absolute -top-8 left-1/2 -translate-x-1/2 text-2xl animate-bounce pointer-events-none z-[60]">
-                    ⚔️
-                    <div className="text-[10px] bg-red-600 text-white px-1 rounded-full font-bold">-{piece.attack}</div>
+              <div
+                key={piece.id}
+                {...focusHandlers(focusDataFor(piece), () => true)}
+                onClick={() => { if (selectable) void movePiece(piece.id); }}
+                className={`absolute cursor-pointer ${selectable ? 'z-50' : pieceAnims[piece.id] ? 'z-40' : 'z-20'}`}
+                style={{
+                  left: `${x + offset}%`, top: `${y + offset}%`, width: '6.2%', height: '6.2%',
+                  transform: 'translate(-50%, -50%)',
+                  transition: `left ${transition} ease-out, top ${transition} ease-out`,
+                }}
+              >
+                <div className={`w-full h-full ${pieceAnims[piece.id] ?? ''}`}>
+                  <div key={piece.position} className="w-full h-full anim-hop">
+                    <div className={`relative w-full h-full rounded-full border-2 border-white shadow-md flex items-center justify-center transition-transform ${COLOR_BG[piece.color]} ${selectable ? 'anim-selectable scale-125' : ''}`}>
+                      <span className="anim-idle leading-none select-none" style={{ fontSize: 'min(3.2vw, 16px)' }}>{CHARACTERS[player.characterClass].emoji}</span>
+                      <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-[120%] h-1 bg-black/60 rounded-full overflow-hidden">
+                        <div className={`h-full ${hpColor} transition-all duration-300`} style={{ width: `${hpRatio * 100}%` }} />
+                      </div>
+                      <div className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 bg-black/70 px-1 rounded-full text-[6px] sm:text-[8px] font-bold text-yellow-300 whitespace-nowrap">
+                        ⚔{piece.attack}{piece.range > 0 ? ` 🎯${piece.range}` : ''}
+                      </div>
+                    </div>
                   </div>
-                )}
+                </div>
               </div>
             );
-          }))}
+          })}
+
+          {/* Effects layer */}
+          <div className="absolute inset-0 pointer-events-none z-[70]">
+            {effects.map(fx => {
+              if (fx.kind === 'projectile') {
+                return (
+                  <div
+                    key={fx.id}
+                    className="absolute fx-projectile text-xl text-amber-300 drop-shadow-[0_0_6px_rgba(251,191,36,0.9)]"
+                    style={{ '--x1': `${fx.x}%`, '--y1': `${fx.y}%`, '--x2': `${fx.x2}%`, '--y2': `${fx.y2}%`, '--dur': `${PROJECTILE_MS / speed}ms`, transform: 'translate(-50%, -50%)' } as React.CSSProperties}
+                  >
+                    <div className={fx.spin ? 'fx-spin' : ''} style={fx.spin ? undefined : { transform: `rotate(${fx.angle}deg)` }}>{fx.text}</div>
+                  </div>
+                );
+              }
+              if (fx.kind === 'ring') {
+                return <div key={fx.id} className={`absolute fx-ring w-[7%] h-[7%] rounded-full border-4 ${fx.className}`} style={{ left: `${fx.x}%`, top: `${fx.y}%` }} />;
+              }
+              if (fx.kind === 'burst') {
+                return <div key={fx.id} className="absolute fx-burst text-2xl" style={{ left: `${fx.x}%`, top: `${fx.y}%` }}>{fx.text}</div>;
+              }
+              return (
+                <div key={fx.id} className={`absolute fx-float font-black whitespace-nowrap [text-shadow:0_2px_0_#000,0_0_6px_#000] ${fx.className}`} style={{ left: `${fx.x}%`, top: `${fx.y}%` }}>
+                  {fx.text}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Turn banner */}
+          {banner && (
+            <div key={banner.key} className="absolute top-1/2 left-1/2 z-[80] pointer-events-none anim-banner">
+              <div className={`${COLOR_BG[banner.color]} px-6 py-2 rounded-lg shadow-2xl border-2 border-white whitespace-nowrap flex items-center gap-2`}>
+                <span className="text-2xl">{banner.emoji}</span>
+                <span className="font-black uppercase tracking-tighter text-sm sm:text-lg [text-shadow:0_2px_0_rgba(0,0,0,0.4)]">{banner.text}</span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* CONTROLS */}
-        <div className="flex flex-col gap-4 w-full lg:w-80">
+        <div className="flex flex-col gap-4 w-full max-w-[480px] lg:w-80">
           <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-xl">
             <h2 className="text-lg font-bold mb-3 flex items-center gap-2">
-              <span className={`w-3 h-3 rounded-full ${currentPlayer.color === 'red' ? 'bg-red-500' : currentPlayer.color === 'blue' ? 'bg-blue-500' : currentPlayer.color === 'yellow' ? 'bg-yellow-500' : 'bg-green-500'}`}></span>
-              {currentPlayer.name}
+              <span key={gameState.currentPlayerIndex} className={`anim-pop-in w-9 h-9 rounded-full flex items-center justify-center text-xl border-2 border-white/30 ${COLOR_BG[currentPlayer.color]}`}>
+                {CHARACTERS[currentPlayer.characterClass].emoji}
+              </span>
+              <span className="truncate">{currentPlayer.name}</span>
             </h2>
             <div className="flex items-center gap-4">
-              <div className={`w-14 h-14 bg-white rounded-xl flex items-center justify-center text-3xl font-black text-slate-800 border-4 border-slate-400 ${isRolling ? 'animate-bounce' : ''}`}>{gameState.diceValue || '?'}</div>
-              <button onClick={rollDice} disabled={isRolling || waitingForMove || currentPlayer.isBot} className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-black rounded-xl transition-all shadow-lg text-sm">
-                {isRolling ? 'ROLLING...' : waitingForMove ? 'MOVE PIECE' : 'ROLL DICE'}
+              <Die value={phase === 'rolling' ? rollingFace : gameState.diceValue} rolling={phase === 'rolling'} />
+              <button onClick={rollDice} disabled={phase !== 'idle' || !isHumanTurn} className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-500 active:scale-95 disabled:opacity-50 disabled:active:scale-100 text-white font-black rounded-xl transition-all shadow-lg text-sm">
+                {phase === 'rolling' ? 'ROLLING...' : phase === 'choosing' ? 'PICK A PIECE' : phase === 'animating' ? '...' : isHumanTurn ? 'ROLL DICE' : 'BOT THINKING...'}
               </button>
+            </div>
+            <div className="flex items-center gap-2 mt-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+              Speed
+              {SPEEDS.map((s, i) => (
+                <button key={s} onClick={() => { setSpeedIdx(i); speedRef.current = s; }} className={`px-2 py-0.5 rounded-md ${i === speedIdx ? 'bg-yellow-400 text-slate-900' : 'bg-slate-700 text-slate-300'}`}>{s}x</button>
+              ))}
             </div>
           </div>
 
-          <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 h-40 sm:h-60 overflow-hidden flex flex-col shadow-xl">
+          <div className="bg-slate-800 p-3 rounded-xl border border-slate-700 shadow-xl space-y-1.5">
+            {viewPlayers.map(p => {
+              const home = p.pieces.filter(pc => pc.position === -1).length;
+              const done = p.pieces.filter(pc => pc.position === FINISH).length;
+              const isCurrent = p.id === viewCurrent?.id;
+              return (
+                <div key={p.id} className={`flex items-center gap-2 px-2 py-1 rounded-lg transition-all ${isCurrent ? 'bg-slate-700 ring-1 ring-yellow-400/60' : ''}`}>
+                  <span className={`w-6 h-6 rounded-full flex items-center justify-center text-sm ${COLOR_BG[p.color]}`}>{CHARACTERS[p.characterClass].emoji}</span>
+                  <span className="text-[10px] font-black uppercase tracking-tighter flex-1 truncate">{p.name}</span>
+                  <span className="text-[10px] text-slate-400 font-bold">🏠{home} ⚔{4 - home - done} 👑{done}</span>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 h-40 sm:h-56 overflow-hidden flex flex-col shadow-xl">
             <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2">Battle Log</h3>
             <div className="flex-1 overflow-y-auto text-xs space-y-1 custom-scrollbar">
               {gameState.gameLog.map((log, i) => <div key={i} className={i === 0 ? 'text-yellow-400 font-bold' : 'text-slate-400'}>{log}</div>)}
@@ -499,12 +551,12 @@ export default function LudoGame() {
       </div>
 
       {focusedTile && (
-        <div 
-          className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[100] w-[90%] max-w-[280px] pointer-events-none" 
-          onMouseEnter={keepFocus}
+        <div
+          className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[100] w-[90%] max-w-[280px] pointer-events-none"
+          onMouseEnter={clearFocusTimer}
           onMouseLeave={closeFocus}
         >
-          <div className="bg-slate-800 border border-slate-600 rounded-xl p-3 shadow-2xl relative overflow-hidden pointer-events-auto">
+          <div className="bg-slate-800 border border-slate-600 rounded-xl p-3 shadow-2xl relative overflow-hidden pointer-events-auto anim-fade-in">
             <div className="absolute top-0 left-0 w-full h-1 bg-yellow-400/30"></div>
             <div className="flex justify-between items-center mb-2">
               <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Tile Details</h3>
@@ -512,29 +564,42 @@ export default function LudoGame() {
             </div>
             <div className="space-y-2">
               {(() => {
-                const pieces = gameState.players.flatMap(player => player.pieces.filter(p => {
+                const pieces = viewPlayers.flatMap(player => player.pieces.filter(p => {
                   if (focusedTile.localPos !== undefined) return p.color === focusedTile.color && p.position === focusedTile.localPos;
                   return getGlobalIndex(p.position, p.color) === focusedTile.globalIdx && p.position < 52 && p.position >= 0;
                 }).map(p => ({ piece: p, player })));
 
                 if (pieces.length === 0) return <div className="text-[10px] text-slate-500 italic">No pieces here</div>;
 
-                return pieces.map(({ piece: p, player }) => (
-                  <div key={p.id} onClick={() => { if (gameState.players[gameState.currentPlayerIndex].color === player.color && waitingForMove) { movePiece(p.id); setFocusedTile(null); } }} className="p-2 rounded-lg bg-slate-900/50 border border-slate-700/50 flex items-center gap-3 cursor-pointer hover:border-yellow-400/50 transition-all">
-                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-white font-black text-sm shadow-inner ${player.color === 'red' ? 'bg-red-500' : player.color === 'blue' ? 'bg-blue-500' : player.color === 'yellow' ? 'bg-yellow-500' : 'bg-green-500'}`}>{p.hp}</div>
-                    <div className="flex-1 overflow-hidden">
-                      <div className="text-[10px] font-black text-white truncate uppercase tracking-tighter">{player.name}</div>
-                      <div className="flex gap-2 text-[9px] font-bold text-slate-500">
-                        <span className="flex items-center gap-0.5"><span className="text-orange-400">⚔</span> {p.attack}</span>
-                        <span className="flex items-center gap-0.5"><span className="text-blue-400">🎯</span> {p.range}</span>
+                return pieces.map(({ piece: p, player }) => {
+                  const def = CHARACTERS[player.characterClass];
+                  const selectable = canMoveNow(p);
+                  return (
+                    <div key={p.id} onClick={() => { if (selectable) { void movePiece(p.id); setFocusedTile(null); } }} className={`p-2 rounded-lg bg-slate-900/50 border flex items-center gap-3 transition-all ${selectable ? 'border-yellow-400/60 cursor-pointer hover:bg-slate-900' : 'border-slate-700/50'}`}>
+                      <div className={`w-9 h-9 shrink-0 rounded-full flex items-center justify-center text-xl shadow-inner ${COLOR_BG[player.color]}`}>{def.emoji}</div>
+                      <div className="flex-1 overflow-hidden">
+                        <div className="text-[10px] font-black text-white truncate uppercase tracking-tighter">{player.name}</div>
+                        <div className="h-1.5 bg-black/50 rounded-full overflow-hidden my-1">
+                          <div className="h-full bg-green-400" style={{ width: `${(p.hp / Math.max(p.maxHp, p.hp)) * 100}%` }} />
+                        </div>
+                        <div className="flex gap-2 text-[9px] font-bold text-slate-400">
+                          <span>❤ {p.hp}/{p.maxHp}</span>
+                          <span><span className="text-orange-400">⚔</span> {p.attack}</span>
+                          <span><span className="text-blue-400">🎯</span> {p.range}</span>
+                        </div>
+                        <div className="text-[8px] text-yellow-300/80 truncate">{def.passive}</div>
                       </div>
                     </div>
-                  </div>
-                ));
+                  );
+                });
               })()}
             </div>
           </div>
         </div>
+      )}
+
+      {gameState.isGameOver && (
+        <VictoryOverlay players={gameState.players} winners={gameState.winners} onRestart={() => setGameStarted(false)} />
       )}
     </div>
   );
