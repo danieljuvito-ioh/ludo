@@ -1,8 +1,8 @@
 """Convert an animated GIF (or a folder of frame PNGs) into a horizontal sprite strip.
 
 Usage:
-  python3 scripts/gif-to-strip.py public/sprites/raw/knight/walk_east.gif public/sprites/knight/walk.png
-  python3 scripts/gif-to-strip.py public/sprites/raw/knight/idle_frames/ public/sprites/knight/idle.png
+  python3 scripts/gif-to-strip.py art/knight/walk_south.gif public/sprites/knight/walk.png
+  python3 scripts/gif-to-strip.py art/knight/animations/Idle/south public/sprites/knight/idle.png
 
 Prints the frame count and the GIF's fps so they can be registered in app/lib/sprites.ts.
 """

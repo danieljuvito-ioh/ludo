@@ -65,5 +65,6 @@ public/sprites/knight/attack.png
 ...
 ```
 
-If PixelLab exports something else (separate frames, zip, sprite sheet grid), upload it as-is under
-`public/sprites/raw/` and it will be converted.
+Raw PixelLab exports (zip contents, GIFs) live in `art/<class>/` so they are not deployed.
+Convert them with `python3 scripts/gif-to-strip.py <gif-or-frame-folder> public/sprites/<class>/<anim>.png`
+and register the strip in `app/lib/sprites.ts`.
