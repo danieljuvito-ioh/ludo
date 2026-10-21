@@ -10,7 +10,7 @@ export interface CharacterDef {
   passive: string;
   description: string;
   projectile: string; // shown flying toward the target on ranged attacks
-  spinProjectile: boolean;
+  projectileMotion: 'aim' | 'spin' | 'upright'; // aim rotates the glyph toward the target, upright keeps it as drawn
 }
 
 export const CHARACTERS: Record<CharacterClass, CharacterDef> = {
@@ -24,7 +24,7 @@ export const CHARACTERS: Record<CharacterClass, CharacterDef> = {
     passive: 'Armor: takes 1 less damage (min 1)',
     description: 'Slow to kill. Walks through the battlefield and outlasts everyone.',
     projectile: '🗡️',
-    spinProjectile: true,
+    projectileMotion: 'spin',
   },
   archer: {
     id: 'archer',
@@ -36,7 +36,7 @@ export const CHARACTERS: Record<CharacterClass, CharacterDef> = {
     passive: 'Eagle Eye: starts with range 2',
     description: 'Picks off enemies from afar.',
     projectile: '➳',
-    spinProjectile: false,
+    projectileMotion: 'aim',
   },
   mage: {
     id: 'mage',
@@ -48,7 +48,7 @@ export const CHARACTERS: Record<CharacterClass, CharacterDef> = {
     passive: 'Arcane: starts with 2 attack and range 2',
     description: 'Fireballs anything nearby, but falls to a single blow.',
     projectile: '🔥',
-    spinProjectile: false,
+    projectileMotion: 'upright',
   },
   assassin: {
     id: 'assassin',
@@ -60,7 +60,7 @@ export const CHARACTERS: Record<CharacterClass, CharacterDef> = {
     passive: 'Lifesteal: +1 HP on every kill',
     description: 'Lands on enemies and feeds on their defeat.',
     projectile: '✴️',
-    spinProjectile: true,
+    projectileMotion: 'spin',
   },
 };
 

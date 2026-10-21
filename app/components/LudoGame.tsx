@@ -323,7 +323,7 @@ export default function LudoGame() {
           if (!attackMs) await wait(180);
         } else {
           const angle = (Math.atan2(targetXY.y - moverXY.y, targetXY.x - moverXY.x) * 180) / Math.PI;
-          spawn({ kind: 'projectile', ...moverXY, x2: targetXY.x, y2: targetXY.y, text: def.projectile, spin: def.spinProjectile, angle }, PROJECTILE_MS);
+          spawn({ kind: 'projectile', ...moverXY, x2: targetXY.x, y2: targetXY.y, text: def.projectile, spin: def.projectileMotion === 'spin', angle: def.projectileMotion === 'aim' ? angle : 0 }, PROJECTILE_MS);
           await wait(PROJECTILE_MS);
         }
 
