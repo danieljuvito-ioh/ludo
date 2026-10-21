@@ -7,7 +7,7 @@ import {
   canMove, resolveMove, chooseBotMove, findPiece, getNextPlayerIndex, isPlayerFinished, getPieceCoords, cellCenter,
 } from '../lib/game-logic';
 import { CHARACTERS, CHARACTER_LIST } from '../lib/characters';
-import { Facing, SpriteAnim, hasSprites } from '../lib/sprites';
+import { Facing, SpriteAnim, hasSprites, spriteDuration } from '../lib/sprites';
 import CharacterSprite from './CharacterSprite';
 import Die from './Die';
 import SetupScreen from './SetupScreen';
@@ -312,9 +312,15 @@ export default function LudoGame() {
         turnTo(ev.targetId, targetXY.x, moverXY.x);
         await wait(cameraOnRef.current ? 350 : 0);
 
-        flashPiece(ev.attackerId, 'anim-attack', 350);
+        // Sprite animations drive the timing: damage lands on the swing, not before it
+        const attackMs = spriteDuration(player.characterClass, 'attack');
+        const hurtMs = spriteDuration(target.player.characterClass, 'hurt');
+        const deathMs = spriteDuration(target.player.characterClass, 'death');
+
+        flashPiece(ev.attackerId, 'anim-attack', attackMs ?? 350);
+        if (attackMs) await wait(attackMs * 0.55);
         if (melee) {
-          await wait(180);
+          if (!attackMs) await wait(180);
         } else {
           const angle = (Math.atan2(targetXY.y - moverXY.y, targetXY.x - moverXY.x) * 180) / Math.PI;
           spawn({ kind: 'projectile', ...moverXY, x2: targetXY.x, y2: targetXY.y, text: def.projectile, spin: def.spinProjectile, angle }, PROJECTILE_MS);
@@ -323,15 +329,16 @@ export default function LudoGame() {
 
         spawn({ kind: 'burst', ...targetXY, text: melee ? '⚔️' : '💥' }, 500);
         spawn({ kind: 'float', ...targetXY, text: `-${ev.damage}`, className: 'text-red-500 text-2xl' }, 900);
-        flashPiece(ev.targetId, 'anim-hit', 450);
+        flashPiece(ev.targetId, 'anim-hit', Math.max(450, hurtMs ?? 0));
         patchPiece(ev.targetId, { hp: ev.hpAfter });
         if (ev.killed || ev.damage >= 2) shakeBoard();
-        await wait(500);
+        await wait(Math.max(500, hurtMs ?? 0, attackMs ? attackMs * 0.45 : 0));
 
         if (ev.killed) {
-          flashPiece(ev.targetId, 'anim-die', 650);
+          // Sprite deaths play to the last frame and hold it briefly before the piece goes home
+          flashPiece(ev.targetId, 'anim-die', deathMs ? deathMs + 500 : 650);
           spawn({ kind: 'float', ...targetXY, text: '💀', className: 'text-3xl' }, 900);
-          await wait(600);
+          await wait(deathMs ? deathMs + 400 : 600);
           const reset = findPiece(result.players, ev.targetId)!.piece;
           patchPiece(ev.targetId, { position: -1, hp: reset.hp, maxHp: reset.maxHp, attack: reset.attack, range: reset.range });
           await wait(150);

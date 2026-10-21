@@ -28,6 +28,19 @@
           "south-west": "Idle/rotations/south-west.png"
         },
         "animations": {
+          "The_knight_pulls_the_longsword_back_across_the_bod": {
+            "south": [
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_000.png",
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_001.png",
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_002.png",
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_003.png",
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_004.png",
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_005.png",
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_006.png",
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_007.png",
+              "Idle/animations/The_knight_pulls_the_longsword_back_across_the_bod/south/frame_008.png"
+            ]
+          },
           "Walking": {
             "south": [
               "Idle/animations/Walking/south/frame_000.png",
@@ -51,11 +64,37 @@
               "Idle/animations/Idle/south/frame_006.png",
               "Idle/animations/Idle/south/frame_007.png"
             ]
+          },
+          "The_knight_is_struck_from_the_right_side_and_recoi": {
+            "south": [
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_000.png",
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_001.png",
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_002.png",
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_003.png",
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_004.png",
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_005.png",
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_006.png",
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_007.png",
+              "Idle/animations/The_knight_is_struck_from_the_right_side_and_recoi/south/frame_008.png"
+            ]
+          },
+          "The_knight_staggers_backward_from_a_final_blow_the": {
+            "south": [
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_000.png",
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_001.png",
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_002.png",
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_003.png",
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_004.png",
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_005.png",
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_006.png",
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_007.png",
+              "Idle/animations/The_knight_staggers_backward_from_a_final_blow_the/south/frame_008.png"
+            ]
           }
         }
       }
     }
   ],
   "export_version": "3.1",
-  "export_date": "2026-10-21T04:27:31.104019"
+  "export_date": "2026-10-21T06:20:48.087772"
 }
